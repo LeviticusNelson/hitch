@@ -18,6 +18,9 @@ pub const Config = struct {
     fake_cursor: bool = false,
     instance_id: ?[]const u8 = null,
     tool_callback_port: u16 = 18771,
+    managed_cursor_keys: []const []const u8 = &.{},
+    max_active_runs: u32 = 32,
+    max_runs_per_key: u32 = 8,
 
     pub fn fromEnv(env: *const std.process.Environ.Map, allocator: std.mem.Allocator) !Config {
         var c: Config = .{};
@@ -34,6 +37,15 @@ pub const Config = struct {
         c.fake_cursor = isTruthy(env.get("FAKE_CURSOR"));
         c.instance_id = emptyToNull(env.get("INSTANCE_ID"));
         if (env.get("TOOL_CALLBACK_PORT")) |p| c.tool_callback_port = std.fmt.parseInt(u16, p, 10) catch c.tool_callback_port;
+        if (env.get("MAX_ACTIVE_RUNS")) |n| c.max_active_runs = std.fmt.parseInt(u32, n, 10) catch c.max_active_runs;
+        if (env.get("MAX_RUNS_PER_KEY")) |n| c.max_runs_per_key = std.fmt.parseInt(u32, n, 10) catch c.max_runs_per_key;
+        if (env.get("MANAGED_CURSOR_KEYS")) |raw| {
+            c.managed_cursor_keys = try splitComma(allocator, raw);
+        } else if (c.managed_cursor_key) |one| {
+            const one_list = try allocator.alloc([]const u8, 1);
+            one_list[0] = one;
+            c.managed_cursor_keys = one_list;
+        }
         c.state_dir = env.get("STATE_DIR") orelse try homeJoin(allocator, env, ".cursor-sdk2api-zig");
         c.workspace_dir = env.get("WORKSPACE_DIR") orelse try std.fs.path.join(allocator, &.{ c.state_dir, "workspace" });
         return c;
@@ -49,6 +61,17 @@ fn emptyToNull(v: ?[]const u8) ?[]const u8 {
 fn isTruthy(v: ?[]const u8) bool {
     const s = v orelse return false;
     return std.mem.eql(u8, s, "1") or std.ascii.eqlIgnoreCase(s, "true") or std.ascii.eqlIgnoreCase(s, "yes");
+}
+
+fn splitComma(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
+    var out = std.ArrayList([]const u8).empty;
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        const t = std.mem.trim(u8, part, " \t");
+        if (t.len == 0) continue;
+        try out.append(allocator, t);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn homeJoin(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, name: []const u8) ![]u8 {

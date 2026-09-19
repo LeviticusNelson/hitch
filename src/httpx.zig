@@ -11,6 +11,7 @@ const ids = @import("ids.zig");
 const digest = @import("digest.zig");
 const jsonx = @import("jsonx.zig");
 const models = @import("models.zig");
+const pool_mod = @import("pool.zig");
 const protocol = @import("protocol.zig");
 const cursor_api = @import("cursor_api.zig");
 const bridge_mod = @import("bridge.zig");
@@ -31,6 +32,8 @@ pub const App = struct {
     active_runs: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     replay_mu: Io.Mutex = .init,
     replay: std.StringHashMap([]u8) = undefined,
+    runs_by_key: std.StringHashMap(u32) = undefined,
+    pool: ?*pool_mod.Pool = null,
 };
 
 pub const BridgeClient = struct {
@@ -107,7 +110,6 @@ fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
         .ok => |a| a,
         .err => |e| return sendErr(reply, e, request_id, path, false),
     };
-    _ = cred;
 
     if (method == .GET and std.mem.eql(u8, path, "/v1/account")) {
         const json = try accountJson(app, arena);
@@ -174,8 +176,10 @@ fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
             return sendJson(reply, .ok, cached, request_id, session_hint);
         }
     }
-    _ = app.active_runs.fetchAdd(1, .seq_cst);
-    defer _ = app.active_runs.fetchSub(1, .seq_cst);
+    if (beginRun(app, cred.cursor_api_key)) |err| {
+        return sendErr(reply, err, request_id, path, isOpenAi(path));
+    }
+    defer endRun(app, cred.cursor_api_key);
 
     if (isCompactPath(path) or p.compaction_trigger) {
         const compact_id = try ids.compactId(app.io, arena);
@@ -698,6 +702,36 @@ fn isCompactPath(path: []const u8) bool {
 
 fn unixNow(io: Io) i64 {
     return @intCast(@divTrunc(Io.Clock.real.now(io).nanoseconds, 1_000_000_000));
+}
+
+fn beginRun(app: *App, key: []const u8) ?errors.Error {
+    const global = app.active_runs.load(.seq_cst);
+    if (global >= app.config.max_active_runs) {
+        return errors.rateLimited("global_active_runs limit reached");
+    }
+    app.replay_mu.lockUncancelable(app.io);
+    defer app.replay_mu.unlock(app.io);
+    const cur = app.runs_by_key.get(key) orelse 0;
+    if (cur >= app.config.max_runs_per_key) {
+        return errors.rateLimited("per-credential run limit reached");
+    }
+    const owned = app.gpa.dupe(u8, key) catch key;
+    app.runs_by_key.put(owned, cur + 1) catch {};
+    _ = app.active_runs.fetchAdd(1, .seq_cst);
+    return null;
+}
+
+fn endRun(app: *App, key: []const u8) void {
+    _ = app.active_runs.fetchSub(1, .seq_cst);
+    app.replay_mu.lockUncancelable(app.io);
+    defer app.replay_mu.unlock(app.io);
+    if (app.runs_by_key.get(key)) |n| {
+        if (n <= 1) {
+            _ = app.runs_by_key.remove(key);
+        } else {
+            app.runs_by_key.put(key, n - 1) catch {};
+        }
+    }
 }
 
 fn lookupReplay(app: *App, hex: []const u8) ?[]const u8 {

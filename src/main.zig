@@ -14,6 +14,8 @@ const httpx = @import("httpx.zig");
 const ids = @import("ids.zig");
 const jsonx = @import("jsonx.zig");
 const models = @import("models.zig");
+const persist = @import("persist.zig");
+const pool_mod = @import("pool.zig");
 const protocol = @import("protocol.zig");
 const toolcb = @import("toolcb.zig");
 const rawhttp = @import("rawhttp.zig");
@@ -45,7 +47,15 @@ pub fn main(init: std.process.Init) !void {
         .bridge = null,
         .catalog = null,
         .replay = std.StringHashMap([]u8).init(gpa),
+        .runs_by_key = std.StringHashMap(u32).init(gpa),
+        .pool = null,
     };
+
+    var key_pool: pool_mod.Pool = undefined;
+    if (cfg.managed_cursor_keys.len > 0) {
+        key_pool = pool_mod.Pool.init(io, gpa, cfg.managed_cursor_keys);
+        app.pool = &key_pool;
+    }
 
     if (cfg.cursor_api_key) |key| {
         catalog_store = .{
@@ -104,6 +114,10 @@ pub fn main(init: std.process.Init) !void {
                         app.bridge = &bridge_client;
                         app.cursor_bridge = b;
                         app.use_fake = false;
+                        b.persist_path = try std.fs.path.join(arena, &.{ cfg.state_dir, "pending.jsonl" });
+                        b.pool = app.pool;
+                        const pending = persist.loadAll(io, b.persist_path, arena) catch &.{};
+                        if (pending.len > 0) std.log.info("pending jsonl n={d}", .{pending.len});
                     } else |err| {
                         std.log.warn("official sdk-bridge ping failed ({t}); catalog stays native, inference unavailable", .{err});
                     }

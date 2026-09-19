@@ -11,8 +11,43 @@ pub fn sha256HexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     return allocator.dupe(u8, hex[0..]);
 }
 
+/// Transcript minus the latest `user: …` block.
+pub fn stripLastUserBlock(flatten_text: []const u8, last_user_text: []const u8) []const u8 {
+    var prefix = flatten_text;
+    if (last_user_text.len > 0 and std.mem.endsWith(u8, flatten_text, last_user_text)) {
+        prefix = flatten_text[0 .. flatten_text.len - last_user_text.len];
+        const labels = [_][]const u8{ "\nuser: ", "user: " };
+        for (labels) |lab| {
+            if (std.mem.endsWith(u8, prefix, lab)) {
+                prefix = prefix[0 .. prefix.len - lab.len];
+                break;
+            }
+        }
+    }
+    return prefix;
+}
+
+pub fn lineageKey(system_text: []const u8, prefix: []const u8) [64]u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(system_text);
+    h.update("\n");
+    h.update(prefix);
+    var out: [32]u8 = undefined;
+    h.final(&out);
+    return std.fmt.bytesToHex(out, .lower);
+}
+
 test "sha256Hex is stable" {
     const a = sha256Hex("hello");
     const b = sha256Hex("hello");
     try std.testing.expectEqualSlices(u8, a[0..], b[0..]);
+}
+
+test "lineageKey of turn-2 prefix matches turn-1 full flatten" {
+    const turn1 = "user: hi";
+    const stored = lineageKey("sys", turn1);
+    const prefix = stripLastUserBlock("user: hi\nuser: next", "next");
+    try std.testing.expectEqualStrings("user: hi", prefix);
+    const looked = lineageKey("sys", prefix);
+    try std.testing.expectEqualSlices(u8, stored[0..], looked[0..]);
 }

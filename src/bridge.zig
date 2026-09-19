@@ -1,8 +1,11 @@
 const std = @import("std");
 const Io = std.Io;
+const digest = @import("digest.zig");
 const encode = @import("encode.zig");
 const jsonx = @import("jsonx.zig");
 const models = @import("models.zig");
+const persist = @import("persist.zig");
+const pool_mod = @import("pool.zig");
 const protocol = @import("protocol.zig");
 const toolcb = @import("toolcb.zig");
 
@@ -24,10 +27,13 @@ pub const Bridge = struct {
     agents: std.StringHashMap([]const u8) = undefined,
     efforts: std.StringHashMap([]const u8) = undefined,
     lives: std.StringHashMap(*Live) = undefined,
+    lineage: std.StringHashMap([]const u8) = undefined,
     hub: *toolcb.Hub,
     group: *Io.Group,
     mu: Io.Mutex = .init,
     last_err: []const u8 = "",
+    persist_path: []const u8 = "",
+    pool: ?*pool_mod.Pool = null,
 
     pub fn unary(self: *Bridge, arena: std.mem.Allocator, path: []const u8, payload: []const u8) ![]u8 {
         const url = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.base_url, path });
@@ -88,19 +94,35 @@ pub const Bridge = struct {
         sink: Sink,
     ) !encode.Turn {
         if (parsed.continuation.len > 0) {
+            var restored = false;
+            if (self.liveForContinuation(session_id, parsed.continuation) == null) {
+                restored = (self.restorePending(arena, parsed, session_id) catch null) != null;
+            }
             try self.preflightContinuation(arena, parsed, session_id);
-            const live = self.liveForContinuation(session_id, parsed.continuation) orelse {
+            const live = self.liveForContinuation(session_id, parsed.continuation);
+            const live_ptr = live orelse {
                 self.last_err = try std.fmt.allocPrint(arena, "unknown tool_use_id: {s}", .{parsed.continuation[0].call_id});
                 return error.UnknownToolId;
             };
-            try self.applyContinuation(arena, live, parsed);
-            live.setSink(sink);
-            defer live.setSink(.{});
-            return self.waitBoundary(arena, live, parsed, message_id, session_id, now);
+            try self.applyContinuation(arena, live_ptr, parsed);
+            if (self.persist_path.len > 0) persist.removeSession(self.io, self.persist_path, live_ptr.session_id, arena);
+            if (restored) {
+                const send_json_tmp = try std.fmt.allocPrint(arena,
+                    "{{\"agentId\":{f},\"message\":{{\"text\":\"\"}},\"options\":{{\"enableDeltas\":true,\"local\":{{\"force\":true}}}}}}",
+                    .{std.json.fmt(live_ptr.agent_id, .{})},
+                );
+                live_ptr.send_json = try self.gpa.dupe(u8, send_json_tmp);
+                self.group.concurrent(self.io, sendLoop, .{live_ptr}) catch self.group.async(self.io, sendLoop, .{live_ptr});
+            }
+            live_ptr.setSink(sink);
+            defer live_ptr.setSink(.{});
+            return self.waitBoundary(arena, live_ptr, parsed, message_id, session_id, now);
         }
 
+        const prefix = digest.stripLastUserBlock(parsed.flatten_text, parsed.last_user_text);
+        const lookup = digest.lineageKey(parsed.system_text, prefix);
         self.mu.lockUncancelable(self.io);
-        const known = self.agents.get(session_id) != null;
+        const known = self.agents.get(session_id) != null or self.lineage.get(lookup[0..]) != null;
         self.mu.unlock(self.io);
         const agent_id = try self.ensureAgent(arena, parsed, session_id);
         const raw_prompt = if (known and parsed.last_user_text.len > 0) parsed.last_user_text else parsed.flatten_text;
@@ -265,6 +287,7 @@ pub const Bridge = struct {
         }
         const snaps = try self.hub.snapshotUnresolved(arena, live.agent_id);
         live.replacePublished(snaps) catch {};
+        self.savePending(arena, live, parsed, snaps);
         live.mu.lockUncancelable(self.io);
         const text = try arena.dupe(u8, live.text.items);
         const thinking = try arena.dupe(u8, live.thinking.items);
@@ -316,32 +339,135 @@ pub const Bridge = struct {
             };
             self.efforts.put(key, val) catch {};
         }
+        const prefix = digest.stripLastUserBlock(parsed.flatten_text, parsed.last_user_text);
+        const lookup = digest.lineageKey(parsed.system_text, prefix);
+        if (self.lineage.get(lookup[0..])) |existing| {
+            const sid_copy = self.gpa.dupe(u8, session_id) catch {
+                self.mu.unlock(self.io);
+                return error.OutOfMemory;
+            };
+            self.agents.put(sid_copy, existing) catch {};
+            self.mu.unlock(self.io);
+            return existing;
+        }
         if (self.agents.get(session_id)) |id| {
             self.mu.unlock(self.io);
             return id;
         }
         self.mu.unlock(self.io);
+        var api_key = self.api_key;
+        if (self.pool) |p| {
+            if (p.bindOrPick(session_id)) |picked| api_key = picked;
+        }
         const tools_field: []const u8 = if (parsed.tools.len > 0) ",\"tools\":{\"names\":[\"mcp\"]}" else "";
+        const created = self.createAgent(arena, parsed, api_key, tools_field) catch |err| blk: {
+            if (self.pool) |p| {
+                if (p.failover(session_id, api_key)) |next_key| {
+                    break :blk self.createAgent(arena, parsed, next_key, tools_field) catch return err;
+                }
+            }
+            return err;
+        };
+        const created_json = try std.json.parseFromSlice(std.json.Value, arena, created, .{});
+        const agent_id = jsonx.getStr(created_json.value, "agentId") orelse return error.BridgeCreateFailed;
+        const durable = try self.gpa.dupe(u8, agent_id);
+        const sid = try self.gpa.dupe(u8, session_id);
+        const store = digest.lineageKey(parsed.system_text, parsed.flatten_text);
+        const lin_key = try self.gpa.dupe(u8, store[0..]);
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        try self.agents.put(sid, durable);
+        self.lineage.put(lin_key, durable) catch {};
+        return durable;
+    }
+
+    fn createAgent(self: *Bridge, arena: std.mem.Allocator, parsed: protocol.Parsed, api_key: []const u8, tools_field: []const u8) ![]u8 {
         const create = try std.fmt.allocPrint(arena,
             "{{\"options\":{{\"model\":{{\"id\":{f}{s}}},\"apiKey\":{f},\"local\":{{\"cwd\":[{f}]{s}}},\"disallowedTools\":[\"shell\",\"read\",\"edit\",\"task\",\"webSearch\",\"webFetch\"]{s}}}}}",
             .{
                 std.json.fmt(parsed.upstream_model, .{}),
                 try effortJson(arena, parsed.effort),
-                std.json.fmt(self.api_key, .{}),
+                std.json.fmt(api_key, .{}),
                 std.json.fmt(self.workspace, .{}),
                 try customToolsJson(arena, parsed.tools),
                 tools_field,
             },
         );
-        const created = try self.unary(arena, "/sdk.v1.SdkAgentService/CreateAgent", create);
-        const created_json = try std.json.parseFromSlice(std.json.Value, arena, created, .{});
-        const agent_id = jsonx.getStr(created_json.value, "agentId") orelse return error.BridgeCreateFailed;
-        const durable = try self.gpa.dupe(u8, agent_id);
-        const sid = try self.gpa.dupe(u8, session_id);
+        return self.unary(arena, "/sdk.v1.SdkAgentService/CreateAgent", create);
+    }
+
+    fn restorePending(self: *Bridge, arena: std.mem.Allocator, parsed: protocol.Parsed, session_id: []const u8) !?*Live {
+        if (self.persist_path.len == 0) return null;
+        const recs = persist.loadAll(self.io, self.persist_path, arena) catch return null;
+        var match: ?persist.Record = null;
+        for (recs) |rec| {
+            if (std.mem.eql(u8, rec.session_id, session_id)) {
+                match = rec;
+                break;
+            }
+            for (rec.tools) |t| {
+                for (parsed.continuation) |c| {
+                    if (std.mem.eql(u8, t.call_id, c.call_id)) {
+                        match = rec;
+                        break;
+                    }
+                }
+            }
+        }
+        const rec = match orelse return null;
+        for (rec.tools) |t| {
+            _ = self.hub.announce(.{
+                .tool_name = t.name,
+                .tool_call_id = t.call_id,
+                .agent_id = rec.agent_id,
+                .args_json = t.args,
+            }) catch continue;
+        }
+        const live = try self.gpa.create(Live);
+        live.* = .{
+            .bridge = self,
+            .io = self.io,
+            .gpa = self.gpa,
+            .arena_state = std.heap.ArenaAllocator.init(self.gpa),
+            .send_json = try self.gpa.dupe(u8, "{}"),
+            .agent_id = try self.gpa.dupe(u8, rec.agent_id),
+            .session_id = try self.gpa.dupe(u8, rec.session_id),
+        };
+        var snaps = try arena.alloc(toolcb.WaiterSnap, rec.tools.len);
+        for (rec.tools, 0..) |t, i| {
+            snaps[i] = .{ .call_id = t.call_id, .name = t.name, .args_json = t.args };
+        }
+        live.replacePublished(snaps) catch {};
+        const sid = try self.gpa.dupe(u8, rec.session_id);
+        const aid = try self.gpa.dupe(u8, rec.agent_id);
         self.mu.lockUncancelable(self.io);
-        defer self.mu.unlock(self.io);
-        try self.agents.put(sid, durable);
-        return durable;
+        self.agents.put(sid, aid) catch {};
+        self.lives.put(live.session_id, live) catch {};
+        self.mu.unlock(self.io);
+        std.log.info("restore pending session={s} agent={s} tools={d}", .{ rec.session_id, rec.agent_id, rec.tools.len });
+        return live;
+    }
+
+    fn savePending(self: *Bridge, arena: std.mem.Allocator, live: *Live, parsed: protocol.Parsed, snaps: []const toolcb.WaiterSnap) void {
+        if (self.persist_path.len == 0) return;
+        if (snaps.len == 0) {
+            persist.removeSession(self.io, self.persist_path, live.session_id, arena);
+            return;
+        }
+        var tools = arena.alloc(persist.ToolRec, snaps.len) catch return;
+        for (snaps, 0..) |s, i| {
+            tools[i] = .{ .call_id = s.call_id, .name = s.name, .args = s.args_json };
+        }
+        const rec = persist.Record{
+            .session_id = live.session_id,
+            .agent_id = live.agent_id,
+            .model = parsed.model,
+            .effort = parsed.effort orelse "",
+            .tools = tools,
+        };
+        persist.upsertFile(self.io, self.persist_path, rec, arena) catch |err| {
+            std.log.warn("persist pending failed ({t})", .{err});
+        };
     }
 
     fn sendCollect(self: *Bridge, arena: std.mem.Allocator, send_json: []const u8, live: *Live) !void {
@@ -684,6 +810,7 @@ pub fn spawn(
         .agents = std.StringHashMap([]const u8).init(gpa),
         .efforts = std.StringHashMap([]const u8).init(gpa),
         .lives = std.StringHashMap(*Live).init(gpa),
+        .lineage = std.StringHashMap([]const u8).init(gpa),
         .hub = hub,
         .group = group,
     };

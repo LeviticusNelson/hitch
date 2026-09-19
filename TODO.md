@@ -4,7 +4,7 @@ Tracked build list for `cursor-sdk2api-zig` vs Node gold (`cursor-sdk2api` / `do
 
 **Status:** `done` · `partial` · `missing` · `skip` (out of scope)
 
-Last reviewed: 2026-09-19 (images, catalog cache, digest replay, health capacity, tool_choice, effort 409).
+Last reviewed: 2026-09-19 (pending jsonl, lineage hash, managed pool, run caps).
 
 ---
 
@@ -51,10 +51,10 @@ Last reviewed: 2026-09-19 (images, catalog cache, digest replay, health capacity
 | Item | Status | Notes |
 |---|---|---|
 | `x-cursor-session-id` completed follow-up (`Agent.resume`) E2E | done | Reuse agent; Send last user turn only |
-| Ordinary next turn without session header | partial | Lineage reuse when session id matches; no transcript-hash coordinator |
-| Pending-tool restart after gateway kill | missing | Waiters are in-memory; jsonl persist still open |
+| Ordinary next turn without session header | done | `digest.stripLastUserBlock` + lineage map; lookup prefix, store full flatten |
+| Pending-tool restart after gateway kill | done | `state_dir/pending.jsonl`; restore waiters; Send `local.force=true` |
 | Duplicate-same request digest replay | done | SHA-256 of body, non-stream |
-| Persist lineage across process restart | missing | agents map is process-local |
+| Persist lineage across process restart | partial | Lineage is in-memory; pending tools jsonl survives kill |
 
 ### 4. Long-session / compact
 
@@ -98,9 +98,9 @@ Last reviewed: 2026-09-19 (images, catalog cache, digest replay, health capacity
 | Item | Status | Notes |
 |---|---|---|
 | BYOK | done | |
-| Managed `GATEWAY_ACCESS_KEY` + pool | partial | Single `MANAGED_CURSOR_KEY`; no round-robin pool |
-| Continuation stuck to original credential | partial | One bridge api_key per process |
-| Managed failover before response starts | missing | Health advertises flag in managed mode |
+| Managed `GATEWAY_ACCESS_KEY` + pool | done | `MANAGED_CURSOR_KEYS` comma list, round-robin bind per session |
+| Continuation stuck to original credential | done | `Pool.binds` session → key |
+| Managed failover before response starts | done | CreateAgent retry with `Pool.failover` |
 
 ---
 
@@ -112,14 +112,14 @@ Last reviewed: 2026-09-19 (images, catalog cache, digest replay, health capacity
 |---|---|---|
 | Structured logs without secrets | partial | Health not logged; keys not printed |
 | Graceful shutdown (`shutting_down`) | partial | Health field + `active_runs`; stop.sh SIGTERM |
-| Active-run / per-credential limits | partial | `capacity.global_active_runs` counted; no cap yet |
+| Active-run / per-credential limits | done | `MAX_ACTIVE_RUNS` (32) and `MAX_RUNS_PER_KEY` (8); 429 when hit |
 | Health: `transcript_tool_recovery`, `stale_auth_recovery`, `managed_account_failover` | done | Advertised on `/health` |
 
 ### 10. Testing / CI
 
 | Item | Status | Notes |
 |---|---|---|
-| Zig↔Node SSE fixture A/B | partial | `compare-health.sh`; Zig is daily driver `:8080` |
+| Zig↔Node SSE fixture A/B | done | `scripts/compare-sse.sh` (Node optional on `:8081`) |
 | Live smoke matrix | partial | `run-smoke.sh` + residual + stability_matrix |
 | Image + resume in automated suite | partial | Image 422 + base64 in residual; kill/restart still manual |
 | Keep smoke green on binary refresh | done | |
@@ -141,7 +141,7 @@ Last reviewed: 2026-09-19 (images, catalog cache, digest replay, health capacity
 | Cloud Agents (`POST /v1/agents`) | Design: models only |
 | Hosted Cursor tools | Fail closed |
 | OpenAI `previous_response_id` / `store=true` | Fail closed |
-| Native Zig Cursor executor / decompile | No C ABI |
+| Native Zig Cursor executor / decompile | MH_EXECUTE, nm only `__mh_execute_header`; see `docs/native-executor.md` |
 | Operator `/console/` | Node-only |
 | Sand / BeefAPI / type64 | Not Zig day-1 |
 
@@ -149,11 +149,7 @@ Last reviewed: 2026-09-19 (images, catalog cache, digest replay, health capacity
 
 ## Still open (next)
 
-1. Pending-tool jsonl persist + load after kill (`local.force=true`)
-2. Transcript-hash ordinary-turn coordinator without session header
-3. Managed account pool round-robin + failover
-4. Per-credential concurrency cap
-5. Node A/B SSE fixture in CI
+Native Zig Cursor executor remains **skip**: official `cursor-sdk-bridge` is `MH_EXECUTE` with no C ABI (`docs/native-executor.md`). Do not decompile.
 
 ---
 
