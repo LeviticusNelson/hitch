@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import urllib.error
 import urllib.request
@@ -25,6 +26,10 @@ def req(method: str, path: str, body: dict | None = None, stream: bool = False, 
     except urllib.error.HTTPError as e:
         return e.code, e.read(), e.headers.get("content-type", "")
     except TimeoutError as e:
+        return 0, str(e).encode(), "timeout"
+    except socket.timeout as e:
+        return 0, str(e).encode(), "timeout"
+    except urllib.error.URLError as e:
         return 0, str(e).encode(), "timeout"
 
 

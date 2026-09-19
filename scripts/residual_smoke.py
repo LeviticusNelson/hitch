@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -23,6 +26,10 @@ def req(method: str, path: str, body: dict | None = None, timeout: int = 90):
         return e.code, e.read(), e.headers.get("content-type", "")
     except TimeoutError as e:
         return 0, f"TimeoutError: {e}".encode(), ""
+    except socket.timeout as e:
+        return 0, f"TimeoutError: {e}".encode(), ""
+    except urllib.error.URLError as e:
+        return 0, f"URLError: {e}".encode(), ""
     except Exception as e:
         return 0, f"{type(e).__name__}: {e}".encode(), ""
 
@@ -113,6 +120,40 @@ def main() -> int:
         "health",
         status == 200 and h.get("status") == "ok" and (h.get("cursor") or {}).get("inference") == "sdk-bridge",
         json.dumps(h.get("cursor")),
+    )
+
+    # P2: /health must not starve while a live stream holds waitBoundary/sendCollect.
+    health_hits = {"ok": 0, "fail": 0, "detail": ""}
+    stop = threading.Event()
+
+    def poke_health():
+        while not stop.wait(0.15):
+            st, body, _ = req("GET", "/health", timeout=2)
+            if st == 200 and b'"status":"ok"' in body:
+                health_hits["ok"] += 1
+            else:
+                health_hits["fail"] += 1
+                health_hits["detail"] = f"status={st} {body[:80]!r}"
+
+    poker = threading.Thread(target=poke_health, daemon=True)
+    poker.start()
+    st, raw, _ = req(
+        "POST",
+        "/v1/responses",
+        {
+            "model": "grok-4.6",
+            "stream": True,
+            "input": "Reply with exactly the word PONG and do not call any tools.",
+        },
+        timeout=60,
+    )
+    time.sleep(0.3)
+    stop.set()
+    poker.join(timeout=3)
+    expect(
+        "health stays ok during live stream",
+        st == 200 and health_hits["ok"] >= 1 and health_hits["fail"] == 0,
+        f"stream={st} health_ok={health_hits['ok']} health_fail={health_hits['fail']} {health_hits['detail']}",
     )
 
     # Builtin hung here previously
