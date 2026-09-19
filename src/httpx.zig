@@ -12,6 +12,7 @@ const jsonx = @import("jsonx.zig");
 const models = @import("models.zig");
 const protocol = @import("protocol.zig");
 const cursor_api = @import("cursor_api.zig");
+const bridge_mod = @import("bridge.zig");
 
 pub const App = struct {
     io: Io,
@@ -23,6 +24,7 @@ pub const App = struct {
     use_fake: bool,
     bridge: ?*BridgeClient = null,
     catalog: ?*cursor_api.Catalog = null,
+    cursor_bridge: ?*bridge_mod.Bridge = null,
 };
 
 pub const BridgeClient = struct {
@@ -56,7 +58,7 @@ fn serve(app: *App, request: *std.http.Server.Request, arena: std.mem.Allocator)
 
     if (method == .GET and (std.mem.eql(u8, path, "/health") or std.mem.eql(u8, path, "/"))) {
         const catalog_mode: []const u8 = if (app.catalog != null) "native" else "fake";
-        const inference_mode: []const u8 = if (app.use_fake) "fake" else if (app.bridge != null) "sdk-bridge" else "unavailable";
+        const inference_mode: []const u8 = if (app.use_fake) "fake" else if (app.cursor_bridge != null) "sdk-bridge" else "unavailable";
         const body = try encode.healthJson(arena, config_mod.version, app.instance_id, app.sdk_version, true, catalog_mode, inference_mode);
         return sendJson(request, .ok, body, request_id, null);
     }
@@ -157,20 +159,102 @@ fn serve(app: *App, request: *std.http.Server.Request, arena: std.mem.Allocator)
     const sid = session_hint orelse try ids.sessionId(app.io, arena);
     const mid = try ids.messageId(app.io, arena);
     const now = unixNow(app.io);
-    const turn = if (app.use_fake)
-        try engine.Fake.run(arena, p, sid, mid, now)
-    else if (app.bridge) |b|
-        try b.run(b, arena, p, sid, mid, now)
-    else
+
+    if (app.use_fake) {
+        const turn = try engine.Fake.run(arena, p, sid, mid, now);
+        return writeTurn(request, arena, p, turn, request_id);
+    }
+    const br = app.cursor_bridge orelse {
         return sendErr(
             request,
-            errors.upstreamError("Cursor does not publish a model-inference API. Local runs need official cursor-sdk-bridge (not Cloud Agents). Set CURSOR_SDK_BRIDGE or run scripts/fetch-bridge.sh."),
+            errors.upstreamError("Cursor local inference needs official cursor-sdk-bridge (Bun-compiled SDK). The Grok HTTP stack is Zig; Cursor does not publish a Zig executor. Set CURSOR_SDK_BRIDGE or run scripts/fetch-bridge.sh."),
             request_id,
             path,
             isOpenAi(path),
         );
+    };
 
-    return writeTurn(request, arena, p, turn, request_id);
+    if (!p.stream) {
+        const turn = try br.runStreaming(arena, p, sid, mid, now, .{});
+        return writeTurn(request, arena, p, turn, request_id);
+    }
+
+    var buf: [2048]u8 = undefined;
+    var body = try request.respondStreaming(&buf, .{
+        .respond_options = .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
+                .{ .name = "cache-control", .value = "no-cache, no-transform" },
+                .{ .name = "x-accel-buffering", .value = "no" },
+                .{ .name = "x-request-id", .value = request_id },
+                .{ .name = "x-cursor-session-id", .value = sid },
+            },
+        },
+    });
+    var seq: u32 = 0;
+    var box = SseBox{ .body = &body, .arena = arena, .seq = &seq, .kind = p.kind };
+    if (p.kind == .responses) {
+        try writeSse(&body, try encode.sseEvent(arena, "response.created", "{\"response\":{\"status\":\"in_progress\"}}", seq));
+        seq += 1;
+        try writeSse(&body, try encode.sseEvent(arena, "response.in_progress", "{\"response\":{\"status\":\"in_progress\"}}", seq));
+        seq += 1;
+    } else if (p.kind == .messages) {
+        try writeSse(&body, try encode.sseEvent(arena, "message_start", try std.fmt.allocPrint(arena,
+            "{{\"type\":\"message_start\",\"message\":{{\"id\":{f},\"type\":\"message\",\"role\":\"assistant\",\"model\":{f},\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}},\"cursor_session_id\":{f}}}}}",
+            .{ std.json.fmt(mid, .{}), std.json.fmt(p.model, .{}), std.json.fmt(sid, .{}) },
+        ), 0));
+        seq += 1;
+    }
+    const turn = try br.runStreaming(arena, p, sid, mid, now, .{
+        .ctx = &box,
+        .on_text = sseOnText,
+        .on_thinking = sseOnThinking,
+    });
+    switch (p.kind) {
+        .responses => {
+            const json = try encode.encodeResponse(arena, turn);
+            try writeSse(&body, try encode.sseEvent(arena, "response.completed", try std.fmt.allocPrint(arena, "{{\"response\":{s}}}", .{json}), seq));
+        },
+        .messages => {
+            const stop: []const u8 = if (turn.tools.len > 0) "tool_use" else "end_turn";
+            try writeSse(&body, try std.fmt.allocPrint(arena, "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":{d}}}}}\n\n", .{ stop, turn.output_tokens }));
+            try writeSse(&body, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        },
+        .chat => {
+            try writeChatSse(&body, arena, turn, p.include_usage);
+        },
+    }
+    try body.end();
+}
+
+const SseBox = struct {
+    body: *std.http.BodyWriter,
+    arena: std.mem.Allocator,
+    seq: *u32,
+    kind: protocol.Kind,
+};
+
+fn sseOnText(ctx: *anyopaque, piece: []const u8) void {
+    const box: *SseBox = @ptrCast(@alignCast(ctx));
+    if (piece.len == 0) return;
+    if (box.kind == .responses) {
+        const ev = encode.sseEvent(box.arena, "response.output_text.delta", std.fmt.allocPrint(box.arena, "{{\"delta\":{f}}}", .{std.json.fmt(piece, .{})}) catch return, box.seq.*) catch return;
+        writeSse(box.body, ev) catch return;
+        box.seq.* += 1;
+    } else if (box.kind == .messages) {
+        const ev = std.fmt.allocPrint(box.arena, "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{f}}}}}\n\n", .{std.json.fmt(piece, .{})}) catch return;
+        writeSse(box.body, ev) catch return;
+    }
+}
+
+fn sseOnThinking(ctx: *anyopaque, piece: []const u8) void {
+    const box: *SseBox = @ptrCast(@alignCast(ctx));
+    if (piece.len == 0) return;
+    if (box.kind == .responses) {
+        const ev = encode.sseEvent(box.arena, "response.reasoning_summary_text.delta", std.fmt.allocPrint(box.arena, "{{\"delta\":{f}}}", .{std.json.fmt(piece, .{})}) catch return, box.seq.*) catch return;
+        writeSse(box.body, ev) catch return;
+        box.seq.* += 1;
+    }
 }
 
 fn writeTurn(request: *std.http.Server.Request, arena: std.mem.Allocator, parsed: protocol.Parsed, turn: encode.Turn, request_id: []const u8) !void {

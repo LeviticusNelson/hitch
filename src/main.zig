@@ -72,6 +72,7 @@ pub fn main(init: std.process.Init) !void {
                             .impl = b,
                         };
                         app.bridge = &bridge_client;
+                        app.cursor_bridge = b;
                         app.use_fake = false;
                     } else |err| {
                         std.log.warn("official sdk-bridge ping failed ({t}); catalog stays native, inference unavailable", .{err});
@@ -95,7 +96,7 @@ pub fn main(init: std.process.Init) !void {
         cfg.port,
         version,
         if (app.catalog != null) "native" else "fake",
-        if (app.use_fake) "fake" else if (app.bridge != null) "sdk-bridge" else "unavailable",
+        if (app.use_fake) "fake" else if (app.cursor_bridge != null) "sdk-bridge" else "unavailable",
     });
 
     var group: Io.Group = .init;
@@ -152,6 +153,7 @@ test {
     _ = protocol;
     _ = bridge;
     _ = cursor_api;
+    _ = @import("session.zig");
 }
 
 fn pathOnly(target: []const u8) []const u8 {

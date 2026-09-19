@@ -5,6 +5,12 @@ const jsonx = @import("jsonx.zig");
 const models = @import("models.zig");
 const protocol = @import("protocol.zig");
 
+pub const Sink = struct {
+    ctx: *anyopaque = undefined,
+    on_text: ?*const fn (*anyopaque, []const u8) void = null,
+    on_thinking: ?*const fn (*anyopaque, []const u8) void = null,
+};
+
 pub const Bridge = struct {
     io: Io,
     gpa: std.mem.Allocator,
@@ -14,6 +20,8 @@ pub const Bridge = struct {
     api_key: []const u8,
     workspace: []const u8,
     child: ?std.process.Child = null,
+    agents: std.StringHashMap([]const u8) = undefined,
+    mu: Io.Mutex = .init,
 
     pub fn unary(self: *Bridge, arena: std.mem.Allocator, path: []const u8, payload: []const u8) ![]u8 {
         const url = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.base_url, path });
@@ -61,6 +69,53 @@ pub const Bridge = struct {
     }
 
     pub fn run(self: *Bridge, arena: std.mem.Allocator, parsed: protocol.Parsed, session_id: []const u8, message_id: []const u8, now: i64) !encode.Turn {
+        return self.runStreaming(arena, parsed, session_id, message_id, now, .{});
+    }
+
+    pub fn runStreaming(
+        self: *Bridge,
+        arena: std.mem.Allocator,
+        parsed: protocol.Parsed,
+        session_id: []const u8,
+        message_id: []const u8,
+        now: i64,
+        sink: Sink,
+    ) !encode.Turn {
+        const agent_id = try self.ensureAgent(arena, parsed, session_id);
+        const prompt = if (parsed.continuation.len > 0)
+            try formatToolResultsFn(arena, parsed)
+        else
+            clip(parsed.flatten_text, models.sdkPromptMaxCharsForModel(parsed.upstream_model));
+        const send_json = try std.fmt.allocPrint(arena,
+            "{{\"agentId\":{f},\"message\":{{\"text\":{f}}},\"options\":{{\"enableDeltas\":true}}}}",
+            .{ std.json.fmt(agent_id, .{}), std.json.fmt(prompt, .{}) },
+        );
+        var collected = Collected{};
+        try self.sendCollect(arena, send_json, sink, &collected);
+        var tools = try arena.alloc(encode.ToolCall, collected.tools.items.len);
+        for (collected.tools.items, 0..) |t, i| tools[i] = t;
+        const stop: []const u8 = if (collected.tools.items.len > 0) "tool_use" else "end_turn";
+        return .{
+            .message_id = message_id,
+            .session_id = session_id,
+            .model = parsed.model,
+            .created_at = now,
+            .text = try arena.dupe(u8, collected.text.items),
+            .thinking = try arena.dupe(u8, collected.thinking.items),
+            .tools = tools,
+            .input_tokens = protocol.estimateInputTokens(parsed),
+            .output_tokens = @max(@as(u32, 1), @as(u32, @intCast(@min(collected.text.items.len, 16_000) / 4))),
+            .stop_reason = stop,
+        };
+    }
+
+    fn ensureAgent(self: *Bridge, arena: std.mem.Allocator, parsed: protocol.Parsed, session_id: []const u8) ![]const u8 {
+        self.mu.lockUncancelable(self.io);
+        if (self.agents.get(session_id)) |id| {
+            self.mu.unlock(self.io);
+            return id;
+        }
+        self.mu.unlock(self.io);
         const create = try std.fmt.allocPrint(arena,
             "{{\"options\":{{\"model\":{{\"id\":{f}{s}}},\"apiKey\":{f},\"local\":{{\"cwd\":[{f}]{s}}},\"disallowedTools\":[\"shell\",\"read\",\"edit\",\"task\",\"webSearch\",\"webFetch\"]}}}}",
             .{
@@ -74,25 +129,15 @@ pub const Bridge = struct {
         const created = try self.unary(arena, "/sdk.v1.SdkAgentService/CreateAgent", create);
         const created_json = try std.json.parseFromSlice(std.json.Value, arena, created, .{});
         const agent_id = jsonx.getStr(created_json.value, "agentId") orelse return error.BridgeCreateFailed;
-
-        const clipped = clip(parsed.flatten_text, models.sdkPromptMaxCharsForModel(parsed.upstream_model));
-        const send_json = try std.fmt.allocPrint(arena,
-            "{{\"agentId\":{f},\"message\":{{\"text\":{f}}},\"options\":{{\"enableDeltas\":true}}}}",
-            .{ std.json.fmt(agent_id, .{}), std.json.fmt(clipped, .{}) },
-        );
-        const text = try self.sendCollect(arena, send_json);
-        return .{
-            .message_id = message_id,
-            .session_id = session_id,
-            .model = parsed.model,
-            .created_at = now,
-            .text = text,
-            .input_tokens = protocol.estimateInputTokens(parsed),
-            .output_tokens = @max(@as(u32, 1), @as(u32, @intCast(@min(text.len, 16_000) / 4))),
-        };
+        const durable = try self.gpa.dupe(u8, agent_id);
+        const sid = try self.gpa.dupe(u8, session_id);
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        try self.agents.put(sid, durable);
+        return durable;
     }
 
-    fn sendCollect(self: *Bridge, arena: std.mem.Allocator, send_json: []const u8) ![]u8 {
+    fn sendCollect(self: *Bridge, arena: std.mem.Allocator, send_json: []const u8, sink: Sink, collected: *Collected) !void {
         const framed = try frame(arena, send_json);
         const url = try std.fmt.allocPrint(arena, "{s}/sdk.v1.SdkAgentService/Send", .{self.base_url});
         const uri = try std.Uri.parse(url);
@@ -112,19 +157,43 @@ pub const Bridge = struct {
         try req.sendBodyComplete(framed);
         var redirect: [1024]u8 = undefined;
         var response = try req.receiveHead(&redirect);
+        if (@intFromEnum(response.head.status) >= 400) return error.BridgeRpcFailed;
         var transfer: [4096]u8 = undefined;
         const reader = response.reader(&transfer);
-        var text = std.ArrayList(u8).empty;
         while (true) {
             const payload = readFrame(reader, arena) catch |err| switch (err) {
                 error.EndStream => break,
                 else => return err,
             } orelse break;
-            appendDelta(&text, arena, payload) catch {};
+            applyEnvelope(arena, payload, sink, collected) catch {};
         }
-        return text.toOwnedSlice(arena);
+    }
+
+    fn formatToolResults(_: *Bridge, arena: std.mem.Allocator, parsed: protocol.Parsed) ![]u8 {
+        return formatToolResultsFn(arena, parsed);
     }
 };
+
+const Collected = struct {
+    text: std.ArrayList(u8) = .empty,
+    thinking: std.ArrayList(u8) = .empty,
+    tools: std.ArrayList(encode.ToolCall) = .empty,
+};
+
+fn formatToolResultsFn(arena: std.mem.Allocator, parsed: protocol.Parsed) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    for (parsed.continuation) |c| {
+        try out.appendSlice(arena, "tool_result ");
+        try out.appendSlice(arena, c.call_id);
+        try out.appendSlice(arena, ": ");
+        try out.appendSlice(arena, c.output);
+        try out.append(arena, '\n');
+    }
+    if (parsed.last_user_text.len > 0) {
+        try out.appendSlice(arena, parsed.last_user_text);
+    }
+    return out.toOwnedSlice(arena);
+}
 
 fn effortJson(arena: std.mem.Allocator, effort: ?[]const u8) ![]const u8 {
     const e = effort orelse return "";
@@ -168,33 +237,54 @@ fn readFrame(reader: *std.Io.Reader, arena: std.mem.Allocator) !?[]u8 {
     return payload;
 }
 
-fn appendDelta(text: *std.ArrayList(u8), arena: std.mem.Allocator, payload: []const u8) !void {
+fn applyEnvelope(arena: std.mem.Allocator, payload: []const u8, sink: Sink, collected: *Collected) !void {
+    if (payload.len == 0 or payload[0] != '{') return;
     const parsed = std.json.parseFromSlice(std.json.Value, arena, payload, .{}) catch return;
     if (jsonx.get(parsed.value, "interactionUpdate")) |upd| {
         const typ = jsonx.getStr(upd, "type") orelse return;
+        const piece = blk: {
+            const u = jsonx.get(upd, "update") orelse break :blk "";
+            break :blk jsonx.getStr(u, "text") orelse jsonx.getStr(u, "delta") orelse "";
+        };
+        if (piece.len == 0) return;
         if (std.mem.eql(u8, typ, "text-delta") or std.mem.eql(u8, typ, "text_delta")) {
-            if (jsonx.get(upd, "update")) |u| {
-                const piece = jsonx.getStr(u, "text") orelse jsonx.getStr(u, "delta") orelse return;
-                try text.appendSlice(arena, piece);
-            }
+            try collected.text.appendSlice(arena, piece);
+            if (sink.on_text) |fn_ptr| fn_ptr(sink.ctx, piece);
+        } else if (std.mem.indexOf(u8, typ, "thinking") != null) {
+            try collected.thinking.appendSlice(arena, piece);
+            if (sink.on_thinking) |fn_ptr| fn_ptr(sink.ctx, piece);
         }
         return;
     }
     if (jsonx.get(parsed.value, "sdkMessage")) |msg| {
         const typ = jsonx.getStr(msg, "type") orelse return;
-        if (std.mem.eql(u8, typ, "assistant") or std.mem.eql(u8, typ, "thinking")) {
-            if (jsonx.get(msg, "message")) |m| {
-                const piece = jsonx.getStr(m, "text") orelse jsonx.collectText(m, arena) catch return;
-                if (piece.len > 0 and text.items.len == 0) try text.appendSlice(arena, piece);
+        const m = jsonx.get(msg, "message") orelse return;
+        if (std.mem.eql(u8, typ, "assistant")) {
+            const piece = jsonx.getStr(m, "text") orelse jsonx.collectText(m, arena) catch "";
+            if (piece.len > 0 and collected.text.items.len == 0) {
+                try collected.text.appendSlice(arena, piece);
+                if (sink.on_text) |fn_ptr| fn_ptr(sink.ctx, piece);
             }
+        } else if (std.mem.eql(u8, typ, "thinking")) {
+            const piece = jsonx.getStr(m, "text") orelse jsonx.getStr(m, "thinking") orelse jsonx.collectText(m, arena) catch "";
+            if (piece.len > 0 and collected.thinking.items.len == 0) {
+                try collected.thinking.appendSlice(arena, piece);
+                if (sink.on_thinking) |fn_ptr| fn_ptr(sink.ctx, piece);
+            }
+        } else if (std.mem.eql(u8, typ, "tool_call")) {
+            const call_id = jsonx.getStr(m, "callId") orelse jsonx.getStr(m, "id") orelse jsonx.getStr(m, "toolCallId") orelse return;
+            const name = jsonx.getStr(m, "name") orelse jsonx.getStr(m, "toolName") orelse "";
+            const args = jsonx.getStr(m, "arguments") orelse jsonx.getStr(m, "input") orelse "{}";
+            try collected.tools.append(arena, .{ .id = call_id, .name = name, .arguments = args });
         }
         return;
     }
     if (jsonx.get(parsed.value, "result")) |res| {
-        if (jsonx.get(res, "result")) |inner| {
-            if (jsonx.getStr(inner, "result")) |final_text| {
-                if (text.items.len == 0) try text.appendSlice(arena, final_text);
-            }
+        const inner = jsonx.get(res, "result") orelse res;
+        const final_text = jsonx.getStr(inner, "text") orelse jsonx.getStr(inner, "result") orelse "";
+        if (final_text.len > 0 and collected.text.items.len == 0) {
+            try collected.text.appendSlice(arena, final_text);
+            if (sink.on_text) |fn_ptr| fn_ptr(sink.ctx, final_text);
         }
     }
 }
@@ -210,6 +300,7 @@ pub fn findBridgeBinary(env: *const std.process.Environ.Map, allocator: std.mem.
     }
     const home = env.get("HOME") orelse return null;
     const candidate = std.fs.path.join(allocator, &.{ home, ".cursor-sdk2api-zig", "bridge", "v1.0.30", "bin", "cursor-sdk-bridge" }) catch return null;
+    if (candidate.len == 0) return null;
     return candidate;
 }
 
@@ -225,7 +316,7 @@ pub fn spawn(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map
     var reader = stderr.readerStreaming(io, &buf);
     const ready = try waitReady(&reader.interface, gpa);
     const token = try readToken(io, gpa, ready.auth_token_file);
-    const bridge = Bridge{
+    const br = Bridge{
         .io = io,
         .gpa = gpa,
         .client = .{ .allocator = gpa, .io = io },
@@ -234,9 +325,10 @@ pub fn spawn(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map
         .api_key = api_key,
         .workspace = workspace,
         .child = child,
+        .agents = std.StringHashMap([]const u8).init(gpa),
     };
     _ = env;
-    return bridge;
+    return br;
 }
 
 const Ready = struct {
