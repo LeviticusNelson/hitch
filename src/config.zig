@@ -46,7 +46,7 @@ pub const Config = struct {
             one_list[0] = one;
             c.managed_cursor_keys = one_list;
         }
-        c.state_dir = env.get("STATE_DIR") orelse try homeJoin(allocator, env, ".cursor-sdk2api-zig");
+        c.state_dir = env.get("STATE_DIR") orelse try homeJoin(allocator, env, ".hitch");
         c.workspace_dir = env.get("WORKSPACE_DIR") orelse try std.fs.path.join(allocator, &.{ c.state_dir, "workspace" });
         return c;
     }

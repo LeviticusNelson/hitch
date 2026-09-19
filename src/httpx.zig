@@ -670,7 +670,7 @@ fn accountJson(app: *App, arena: std.mem.Allocator) ![]u8 {
         } else |_| {}
     }
     return arena.dupe(u8,
-        "{\"status\":\"ok\",\"identity\":{\"api_key_name\":\"cursor-sdk2api-zig\"},\"runtime\":{\"default_profile\":\"sdk\",\"sand_selectable\":false,\"applies_to_new_sessions\":true},\"capabilities\":{\"identity\":true}}",
+        "{\"status\":\"ok\",\"identity\":{\"api_key_name\":\"hitch\"},\"runtime\":{\"default_profile\":\"sdk\",\"sand_selectable\":false,\"applies_to_new_sessions\":true},\"capabilities\":{\"identity\":true}}",
     );
 }
 

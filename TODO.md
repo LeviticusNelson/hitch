@@ -1,6 +1,31 @@
-# Zig bridge TODO
+# Hitch TODO
 
-Tracked build list for `cursor-sdk2api-zig` vs Node gold (`cursor-sdk2api` / `docs/PROTOCOL_COMPATIBILITY.md`).
+Tracked build list for **hitch** vs Node gold ([cursor-sdk2api](https://github.com/Sunnyender-org/cursor-sdk2api) / `docs/PROTOCOL_COMPATIBILITY.md`). Hitch is a Zig gateway; Cursor inference stays on official `cursor-sdk-bridge`.
+
+---
+
+## Harness compatibility (not done unless marked)
+
+Dogfood each client against hitch on `:8080` the way that product actually talks to an LLM API. Routes existing ≠ harness-complete.
+
+| Harness | Speaks | Status | Notes |
+|---|---|---|---|
+| Grok Build | OpenAI Responses `/v1/responses` | **done** | Daily driver, plugin auto-start, compact-summary intercept |
+| Claude Code | Anthropic `/v1/messages` | **missing** | Hitch serves the route; no `claude` CLI dogfood, cache_control, 1M extras unproven |
+| Codex CLI / Codex VS Code | OpenAI Responses | **missing** | No Codex client matrix; `instructions` / store / previous_response_id stay fail-closed |
+| OpenCode | OpenAI + Anthropic | **missing** | |
+| GitHub Copilot Chat / VS Code LM | OpenAI Chat Completions | **missing** | |
+| Aider | OpenAI Chat Completions | **missing** | |
+| Continue.dev | OpenAI Chat Completions | **missing** | |
+| Cline / Roo Code | Anthropic or OpenAI | **missing** | |
+| Gemini CLI | Gemini / OpenAI-compat | **missing** | No Gemini protocol |
+| Cursor CLI / ACP | Cursor-native | **skip** | Out of scope; hitch is not a Cursor IDE replacement |
+| Open WebUI / LiteLLM | OpenAI | **missing** | |
+| Droid / Factory | varies | **missing** | |
+
+---
+
+# Gateway vs Node gold
 
 **Status:** `done` · `partial` · `missing` · `skip` (out of scope)
 
@@ -31,7 +56,7 @@ Last reviewed: 2026-09-19 (pending jsonl, lineage hash, managed pool, run caps).
 
 | Item | Status | Notes |
 |---|---|---|
-| Base64 `input_image` on `/v1/responses` | done | Parsed to SDK `{data,mimeType}` on Send |
+| Base64 `input_image` on `/v1/responses` | done | Connect nested `{data:{data,mimeType}}` (proto oneof; flat TS shape 502s) |
 | Base64 `image_url` on `/v1/chat/completions` | done | |
 | Images inside Messages content blocks | done | Anthropic `{type:image,source:{base64}}` |
 | Tool-result images (text + base64 image parts) | partial | Text collected; image parts in tool output still text-join |
@@ -156,7 +181,7 @@ Native Zig Cursor executor remains **skip**: official `cursor-sdk-bridge` is `MH
 ## Smoke / evidence
 
 ```bash
-cd /Users/levi/cursor-sdk2api-zig
+cd /Users/levi/hitch
 zig build test
 GROK_GATEWAY=http://127.0.0.1:8080 ./scripts/run-smoke.sh
 ```

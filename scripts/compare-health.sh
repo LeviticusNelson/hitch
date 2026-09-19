@@ -31,7 +31,7 @@ if node.get("status") != "ok":
 if zig.get("status") != "ok":
     print("FAIL: Zig status", zig.get("status"))
     ok = False
-if zig.get("service") != "cursor-sdk2api-zig":
+if zig.get("service") != "hitch":
     print("FAIL: Zig service", zig.get("service"))
     ok = False
 if ok:

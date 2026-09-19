@@ -1,6 +1,6 @@
 {
-  "name": "cursor-sdk2api-zig",
-  "description": "Start the Zig cursor-sdk2api gateway in release mode when Grok runs, and keep Cursor CIDR models on 127.0.0.1:8080.",
+  "name": "hitch",
+  "description": "Start Hitch (Zig Cursor gateway) so Grok CIDR models stay on 127.0.0.1:8080. Inspired by cursor-sdk2api.",
   "version": "0.1.0",
-  "keywords": ["cursor", "cursor-sdk2api", "zig", "gateway"]
+  "keywords": ["cursor", "hitch", "cursor-sdk2api", "zig", "gateway", "grok"]
 }

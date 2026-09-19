@@ -8,3 +8,6 @@ zig-out/
 !env.example
 bridge/
 cursor-sdk-bridge
+smoke-logs/
+scripts/__pycache__/
+*.pyc

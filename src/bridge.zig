@@ -787,9 +787,7 @@ pub fn findBridgeBinary(env: *const std.process.Environ.Map, allocator: std.mem.
         if (p.len > 0) return p;
     }
     const home = env.get("HOME") orelse return null;
-    const candidate = std.fs.path.join(allocator, &.{ home, ".cursor-sdk2api-zig", "bridge", "v1.0.30", "bin", "cursor-sdk-bridge" }) catch return null;
-    if (candidate.len == 0) return null;
-    return candidate;
+    return std.fs.path.join(allocator, &.{ home, ".hitch", "bridge", "v1.0.30", "bin", "cursor-sdk-bridge" }) catch null;
 }
 
 pub fn spawn(

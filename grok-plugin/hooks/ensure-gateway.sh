@@ -8,9 +8,9 @@ if command -v realpath >/dev/null 2>&1; then
   HERE="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
 fi
 PLUGIN_ROOT="${GROK_PLUGIN_ROOT:-$(cd "$HERE/.." && pwd)}"
-BIN="$PLUGIN_ROOT/bin/cursor-sdk2api-zig"
-START="${CURSOR_SDK2API_ZIG_START:-$HOME/.cursor-sdk2api-zig/start.sh}"
-DATA="${GROK_PLUGIN_DATA:-$HOME/.cursor-sdk2api-zig/plugin}"
+BIN="$PLUGIN_ROOT/bin/hitch"
+START="${HITCH_START:-$HOME/.hitch/start.sh}"
+DATA="${GROK_PLUGIN_DATA:-$HOME/.hitch/plugin}"
 mkdir -p "$DATA"
 LOG="$DATA/ensure.log"
 

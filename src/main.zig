@@ -135,7 +135,7 @@ pub fn main(init: std.process.Init) !void {
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.socket.close(io);
 
-    std.log.info("cursor-sdk2api-zig listening http://{s}:{d} version={s} catalog={s} inference={s}", .{
+    std.log.info("hitch listening http://{s}:{d} version={s} catalog={s} inference={s}", .{
         cfg.host,
         cfg.port,
         version,

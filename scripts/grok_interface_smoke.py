@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise Grok-facing routes on a running cursor-sdk2api-zig gateway."""
+"""Exercise Grok-facing routes on a running hitch gateway."""
 
 from __future__ import annotations
 
@@ -77,7 +77,7 @@ def main() -> int:
         "GET /health",
         status == 200
         and health.get("status") == "ok"
-        and health.get("service") == "cursor-sdk2api-zig"
+        and health.get("service") == "hitch"
         and (health.get("cursor") or {}).get("inference") == "sdk-bridge",
         json.dumps({k: health.get(k) for k in ("status", "service", "runtime")})
         + " cursor="

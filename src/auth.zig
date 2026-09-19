@@ -15,6 +15,10 @@ pub const Config = struct {
 };
 
 pub fn presentedSecret(headers: HeaderSet) ?[]const u8 {
+    if (headers.get("x-hitch-key")) |v| {
+        const t = std.mem.trim(u8, v, " \t");
+        if (t.len > 0) return t;
+    }
     if (headers.get("x-cursor-sdk2api-key")) |v| {
         const t = std.mem.trim(u8, v, " \t");
         if (t.len > 0) return t;

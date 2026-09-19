@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Download cursor-sdk-bridge 1.0.30 (matches Node @cursor/sdk pin) into
-# ~/.cursor-sdk2api-zig/bridge/v1.0.30/
+# ~/.hitch/bridge/v1.0.30/ (never commit this binary)
 set -euo pipefail
 VERSION="${CURSOR_SDK_BRIDGE_VERSION:-1.0.30}"
 OS="$(uname -s)"
@@ -15,7 +15,7 @@ case "$ARCH" in
   x86_64|amd64) arch=x64 ;;
   *) echo "unsupported arch: $ARCH" >&2; exit 1 ;;
 esac
-dest="${CURSOR_SDK2API_ZIG_HOME:-$HOME/.cursor-sdk2api-zig}/bridge/v${VERSION}"
+dest="${HITCH_HOME:-$HOME/.hitch}/bridge/v${VERSION}"
 mkdir -p "$dest"
 archive="cursor-sdk-bridge-standalone-${os}-${arch}.tar.gz"
 url="https://github.com/cursor/sdk-bridge/releases/download/v${VERSION}/${archive}"

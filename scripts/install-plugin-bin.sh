@@ -4,8 +4,8 @@
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/sbin:/usr/bin:/bin${PATH:+:$PATH}"
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="$SRC/zig-out/bin/cursor-sdk2api-zig"
-DEST="$SRC/grok-plugin/bin/cursor-sdk2api-zig"
+OUT="$SRC/zig-out/bin/hitch"
+DEST="$SRC/grok-plugin/bin/hitch"
 
 if [[ "${1:-}" == "--build" ]]; then
   (cd "$SRC" && zig build --release=fast)

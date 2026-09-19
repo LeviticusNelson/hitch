@@ -1,4 +1,4 @@
-# cursor-sdk2api-zig design
+# Hitch design
 
 Date: 2026-09-18
 
