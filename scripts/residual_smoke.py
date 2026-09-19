@@ -215,6 +215,34 @@ def main() -> int:
         f"status={status} head={raw[:180]!r}",
     )
 
+    status, raw, _ = req(
+        "POST",
+        "/v1/responses",
+        {
+            "model": "grok-4.6",
+            "stream": False,
+            "input": [
+                {"type": "message", "role": "user", "content": "<user_query>default aggregate to 30 days but keep lifetime</user_query>"},
+                {"type": "message", "role": "assistant", "content": "Inspected the admin report query."},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "Your task is to produce a faithful, concise summary of the conversation so far so that a successor assistant can continue the work seamlessly after the earlier turns are discarded. Output the final summary inside a single <summary>...</summary> block.",
+                },
+            ],
+        },
+        timeout=20,
+    )
+    expect(
+        "grok compact-summary keeps user_query and continue instruction",
+        status == 200
+        and b"<summary>" in raw
+        and b"default aggregate to 30 days" in raw
+        and b"Continue the unfinished task" in raw
+        and b"Output the final summary inside a single" not in raw,
+        f"status={status} head={raw[:240]!r}",
+    )
+
     model_ns: list[int] = []
     model_err: list[str] = []
 

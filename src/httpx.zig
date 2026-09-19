@@ -193,6 +193,7 @@ fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
     }
 
     if (grok_summary.isGrokCompactSummaryRequest(p)) {
+        std.log.info("grok compact-summary intercept session={s}", .{session_hint orelse "-"});
         const sid = session_hint orelse try ids.sessionId(app.io, arena);
         const mid = try ids.messageId(app.io, arena);
         const summary = try grok_summary.buildGrokCompactSummary(arena, p);
@@ -349,10 +350,11 @@ fn sseOnThinking(ctx: *anyopaque, piece: []const u8) void {
             ) catch return;
             boxEmit(box, "response.output_item.added", added);
             const part = std.fmt.allocPrint(box.arena,
-                "{{\"item_id\":{f},\"output_index\":{d},\"summary_index\":0,\"part\":{{\"type\":\"summary_text\",\"text\":\"\"}}}}",
-                .{ std.json.fmt(item_id, .{}), box.reason_index },
+                "{{\"item_id\":{f},\"output_index\":{d},\"summary_index\":0,\"part\":{{\"type\":\"summary_text\",\"text\":{f}}}}}",
+                .{ std.json.fmt(item_id, .{}), box.reason_index, std.json.fmt(piece, .{}) },
             ) catch return;
             boxEmit(box, "response.reasoning_summary_part.added", part);
+            return;
         }
         const data = std.fmt.allocPrint(box.arena,
             "{{\"item_id\":{f},\"output_index\":{d},\"summary_index\":0,\"delta\":{f}}}",
