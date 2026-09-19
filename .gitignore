@@ -1,0 +1,10 @@
+zig-out/
+.zig-cache/
+*.o
+*.a
+.DS_Store
+.env
+.env.*
+!env.example
+bridge/
+cursor-sdk-bridge
