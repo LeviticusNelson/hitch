@@ -19,7 +19,9 @@ Grok-facing routes are implemented:
 - `POST /v1/messages`, `/v1/messages/count_tokens`
 - `POST /v1/chat/completions`
 
-Without `CURSOR_API_KEY` (or with `FAKE_CURSOR=1`) the gateway uses a local fake driver so the HTTP surface can be tested. With a key and `cursor-sdk-bridge` 1.0.30 it creates a local agent and streams `enableDeltas`.
+**Models only, no Cloud Agents.** Catalog and account are native Zig HTTPS to `https://api.cursor.com` (`GET /v1/models`, `GET /v1/me`). Cursor does not publish a completions API, so prompt/stream still uses official `cursor-sdk-bridge` as backup when that binary is installed. This repo does not spawn Cloud Agents and does not clone `@cursor/sdk` internals.
+
+Without `CURSOR_API_KEY` (or with `FAKE_CURSOR=1`) the gateway uses a local fake driver so the HTTP surface can be tested.
 
 See [docs/design.md](docs/design.md).
 

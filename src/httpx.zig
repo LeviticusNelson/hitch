@@ -11,6 +11,7 @@ const ids = @import("ids.zig");
 const jsonx = @import("jsonx.zig");
 const models = @import("models.zig");
 const protocol = @import("protocol.zig");
+const cursor_api = @import("cursor_api.zig");
 
 pub const App = struct {
     io: Io,
@@ -21,6 +22,7 @@ pub const App = struct {
     sdk_version: []const u8,
     use_fake: bool,
     bridge: ?*BridgeClient = null,
+    catalog: ?*cursor_api.Catalog = null,
 };
 
 pub const BridgeClient = struct {
@@ -53,7 +55,9 @@ fn serve(app: *App, request: *std.http.Server.Request, arena: std.mem.Allocator)
     const user_agent = headers.get("user-agent");
 
     if (method == .GET and (std.mem.eql(u8, path, "/health") or std.mem.eql(u8, path, "/"))) {
-        const body = try encode.healthJson(arena, config_mod.version, app.instance_id, app.sdk_version, true);
+        const catalog_mode: []const u8 = if (app.catalog != null) "native" else "fake";
+        const inference_mode: []const u8 = if (app.use_fake) "fake" else if (app.bridge != null) "sdk-bridge" else "unavailable";
+        const body = try encode.healthJson(arena, config_mod.version, app.instance_id, app.sdk_version, true, catalog_mode, inference_mode);
         return sendJson(request, .ok, body, request_id, null);
     }
 
@@ -153,10 +157,18 @@ fn serve(app: *App, request: *std.http.Server.Request, arena: std.mem.Allocator)
     const sid = session_hint orelse try ids.sessionId(app.io, arena);
     const mid = try ids.messageId(app.io, arena);
     const now = unixNow(app.io);
-    const turn = if (app.use_fake or app.bridge == null)
+    const turn = if (app.use_fake)
         try engine.Fake.run(arena, p, sid, mid, now)
+    else if (app.bridge) |b|
+        try b.run(b, arena, p, sid, mid, now)
     else
-        try app.bridge.?.run(app.bridge.?, arena, p, sid, mid, now);
+        return sendErr(
+            request,
+            errors.upstreamError("Cursor does not publish a model-inference API. Local runs need official cursor-sdk-bridge (not Cloud Agents). Set CURSOR_SDK_BRIDGE or run scripts/fetch-bridge.sh."),
+            request_id,
+            path,
+            isOpenAi(path),
+        );
 
     return writeTurn(request, arena, p, turn, request_id);
 }
@@ -289,33 +301,63 @@ fn writeSse(body: *std.http.BodyWriter, bytes: []const u8) !void {
 }
 
 fn modelsJson(app: *App, arena: std.mem.Allocator, user_agent: ?[]const u8) ![]u8 {
-    _ = app;
-    const ids_list = try engine.Fake.listModels(arena);
+    var listed = std.ArrayList(cursor_api.Model).empty;
+    var live_ok = false;
+    if (app.catalog) |cat| {
+        if (cat.listModels(arena)) |live| {
+            try listed.appendSlice(arena, live);
+            live_ok = live.len > 0;
+        } else |_| {}
+    }
+    if (!live_ok) {
+        const ids_list = try engine.Fake.listModels(arena);
+        for (ids_list) |id| {
+            try listed.append(arena, .{ .id = id, .display_name = id });
+        }
+    }
     var out = std.ArrayList(u8).empty;
     try out.appendSlice(arena, "{\"object\":\"list\",\"data\":[");
     var first = true;
-    for (ids_list) |id| {
-        const aliases = try models.catalogModelIdsForClient(arena, id, user_agent);
+    for (listed.items) |item| {
+        const aliases = try models.catalogModelIdsForClient(arena, item.id, user_agent);
         for (aliases) |alias| {
             if (!first) try out.append(arena, ',');
             first = false;
             try out.appendSlice(arena, try std.fmt.allocPrint(arena,
-                "{{\"id\":{f},\"object\":\"model\",\"display_name\":{f},\"context_tokens\":{d},\"compact_max_chars\":{d}}}",
+                "{{\"id\":{f},\"object\":\"model\",\"display_name\":{f},\"description\":{f},\"context_tokens\":{d},\"compact_max_chars\":{d}}}",
                 .{
                     std.json.fmt(alias, .{}),
-                    std.json.fmt(id, .{}),
+                    std.json.fmt(item.display_name, .{}),
+                    std.json.fmt(item.description, .{}),
                     models.contextTokensForModel(alias),
                     models.sdkPromptMaxCharsForModel(alias),
                 },
             ));
         }
     }
-    try out.appendSlice(arena, "],\"status\":\"ok\",\"cache\":{\"stale\":false}}");
+    const stale: []const u8 = if (app.catalog != null and !live_ok) "true" else "false";
+    try out.appendSlice(arena, "],\"status\":\"ok\",\"cache\":{\"stale\":");
+    try out.appendSlice(arena, stale);
+    try out.appendSlice(arena, "}}");
     return out.toOwnedSlice(arena);
 }
 
 fn accountJson(app: *App, arena: std.mem.Allocator) ![]u8 {
-    _ = app;
+    if (app.catalog) |cat| {
+        if (cat.me(arena)) |ident| {
+            return std.fmt.allocPrint(arena,
+                "{{\"status\":\"ok\",\"identity\":{{\"api_key_name\":{f},\"user_id\":{f},\"created_at\":{f},\"first_name\":{f},\"last_name\":{f},\"user_email\":{f}}},\"runtime\":{{\"default_profile\":\"sdk\",\"sand_selectable\":false,\"applies_to_new_sessions\":true}},\"capabilities\":{{\"identity\":true}}}}",
+                .{
+                    std.json.fmt(ident.api_key_name, .{}),
+                    std.json.fmt(ident.user_id, .{}),
+                    std.json.fmt(ident.created_at, .{}),
+                    std.json.fmt(ident.first_name, .{}),
+                    std.json.fmt(ident.last_name, .{}),
+                    std.json.fmt(ident.user_email, .{}),
+                },
+            );
+        } else |_| {}
+    }
     return arena.dupe(u8,
         "{\"status\":\"ok\",\"identity\":{\"api_key_name\":\"cursor-sdk2api-zig\"},\"runtime\":{\"default_profile\":\"sdk\",\"sand_selectable\":false,\"applies_to_new_sessions\":true},\"capabilities\":{\"identity\":true}}",
     );

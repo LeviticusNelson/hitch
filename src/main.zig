@@ -5,6 +5,7 @@ const auth = @import("auth.zig");
 const bridge = @import("bridge.zig");
 const compact_mod = @import("compact.zig");
 const config_mod = @import("config.zig");
+const cursor_api = @import("cursor_api.zig");
 const encode = @import("encode.zig");
 const engine = @import("engine.zig");
 const errors = @import("errors.zig");
@@ -28,6 +29,7 @@ pub fn main(init: std.process.Init) !void {
     io.random(&secret);
 
     const instance = try ids.instanceId(io, arena, cfg.instance_id);
+    var catalog_store: cursor_api.Catalog = undefined;
     var app = httpx.App{
         .io = io,
         .gpa = arena,
@@ -37,39 +39,47 @@ pub fn main(init: std.process.Init) !void {
         .sdk_version = config_mod.sdk_version,
         .use_fake = cfg.fake_cursor or cfg.cursor_api_key == null,
         .bridge = null,
+        .catalog = null,
     };
 
-    var live_bridge: bridge.Bridge = undefined;
+    if (cfg.cursor_api_key) |key| {
+        catalog_store = .{
+            .io = io,
+            .gpa = arena,
+            .client = .{ .allocator = arena, .io = io },
+            .api_key = key,
+        };
+        app.catalog = &catalog_store;
+    }
+
+    var live_bridge: ?bridge.Bridge = null;
     var bridge_client: httpx.BridgeClient = undefined;
-    if (!app.use_fake) {
+    if (!cfg.fake_cursor) {
         if (bridge.findBridgeBinary(init.environ_map, arena)) |bin| {
             if (cfg.cursor_api_key) |key| {
-                live_bridge = bridge.spawn(io, arena, init.environ_map, bin, cfg.workspace_dir, key) catch |err| blk: {
-                    std.log.warn("bridge spawn failed ({t}); using fake Cursor driver", .{err});
-                    app.use_fake = true;
-                    break :blk undefined;
-                };
-                if (!app.use_fake) {
+                if (bridge.spawn(io, arena, init.environ_map, bin, cfg.workspace_dir, key)) |spawned| {
+                    live_bridge = spawned;
+                } else |err| {
+                    std.log.warn("official sdk-bridge spawn failed ({t}); catalog stays native, inference unavailable", .{err});
+                }
+                if (live_bridge) |*b| {
                     var ping_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                     defer ping_arena.deinit();
-                    live_bridge.ping(ping_arena.allocator()) catch |err| {
-                        std.log.warn("bridge ping failed ({t}); using fake Cursor driver", .{err});
-                        app.use_fake = true;
-                    };
-                }
-                if (!app.use_fake) {
-                    bridge_client = .{
-                        .unary = bridgeUnary,
-                        .run = bridgeRun,
-                        .impl = &live_bridge,
-                    };
-                    app.bridge = &bridge_client;
-                    app.sdk_version = config_mod.sdk_version;
+                    if (b.ping(ping_arena.allocator())) |_| {
+                        bridge_client = .{
+                            .unary = bridgeUnary,
+                            .run = bridgeRun,
+                            .impl = b,
+                        };
+                        app.bridge = &bridge_client;
+                        app.use_fake = false;
+                    } else |err| {
+                        std.log.warn("official sdk-bridge ping failed ({t}); catalog stays native, inference unavailable", .{err});
+                    }
                 }
             }
-        } else {
-            std.log.warn("cursor-sdk-bridge not found; set CURSOR_SDK_BRIDGE or run scripts/fetch-bridge.sh", .{});
-            app.use_fake = true;
+        } else if (cfg.cursor_api_key != null) {
+            std.log.warn("no cursor-sdk-bridge binary; GET /v1/models is native HTTPS. Inference needs scripts/fetch-bridge.sh (not Cloud Agents)", .{});
         }
     }
 
@@ -80,11 +90,12 @@ pub fn main(init: std.process.Init) !void {
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.socket.close(io);
 
-    std.log.info("cursor-sdk2api-zig listening http://{s}:{d} version={s} driver={s}", .{
+    std.log.info("cursor-sdk2api-zig listening http://{s}:{d} version={s} catalog={s} inference={s}", .{
         cfg.host,
         cfg.port,
         version,
-        if (app.use_fake) "fake" else "bridge",
+        if (app.catalog != null) "native" else "fake",
+        if (app.use_fake) "fake" else if (app.bridge != null) "sdk-bridge" else "unavailable",
     });
 
     var group: Io.Group = .init;
@@ -140,6 +151,7 @@ test {
     _ = models;
     _ = protocol;
     _ = bridge;
+    _ = cursor_api;
 }
 
 fn pathOnly(target: []const u8) []const u8 {

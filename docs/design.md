@@ -61,4 +61,15 @@ Listen on `127.0.0.1:8081`, `GET /health` JSON, compare script.
 
 ## Current (this tree)
 
-HTTP clone of the Grok-facing surface: models, account, messages, chat, responses, compact, local Grok compact-summary intercept. Cursor traffic uses official `cursor-sdk-bridge` 1.0.30 over Connect JSON when `CURSOR_API_KEY` and the binary are present; otherwise a fake driver so the HTTP contract can be tested without Cursor.
+HTTP clone of the Grok-facing surface: models, account, messages, chat, responses, compact, local Grok compact-summary intercept.
+
+### Cursor-facing (models only, no Cloud Agents)
+
+Cursor does **not** publish a chat-completions / raw inference API. Cloud Agents (`POST /v1/agents`) are out of scope.
+
+| Call | How |
+|---|---|
+| Model catalog, account (`GET /v1/models`, `/v1/me`) | Native Zig HTTPS to `https://api.cursor.com` |
+| Prompt / stream / custom tools | Official `cursor-sdk-bridge` local agent (backup). Not a Zig clone of `@cursor/sdk` private HTTP/2. |
+
+`FAKE_CURSOR=1` or a missing API key uses the local fake driver for HTTP contract tests.
