@@ -80,10 +80,13 @@ pub fn parseResponses(allocator: std.mem.Allocator, body: std.json.Value) Outcom
             const typ = itemType(item) orelse return fail("input item must include type");
             if (isUnsupportedMedia(typ)) return failAlloc(allocator, "{s} is not supported", .{typ});
             if (std.mem.eql(u8, typ, "compaction_trigger")) {
+                // Node flushResults(): only the trailing function_call_output batch is live continuation.
+                continuation.clearRetainingCapacity();
                 trigger = true;
                 continue;
             }
             if (std.mem.eql(u8, typ, "compaction")) {
+                continuation.clearRetainingCapacity();
                 token = jsonx.getStr(item, "encrypted_content") orelse {
                     return fail("compaction item must include encrypted_content");
                 };
@@ -99,6 +102,7 @@ pub fn parseResponses(allocator: std.mem.Allocator, body: std.json.Value) Outcom
                 continue;
             }
             if (std.mem.eql(u8, typ, "function_call") or std.mem.eql(u8, typ, "custom_tool_call")) {
+                continuation.clearRetainingCapacity();
                 const name = jsonx.getStr(item, "name") orelse "";
                 const args = jsonx.getStr(item, "arguments") orelse jsonx.getStr(item, "input") orelse "";
                 appendNamed(&flatten, allocator, "assistant_tool", name) catch return oom();
@@ -106,6 +110,7 @@ pub fn parseResponses(allocator: std.mem.Allocator, body: std.json.Value) Outcom
                 continue;
             }
             if (std.mem.eql(u8, typ, "reasoning")) {
+                continuation.clearRetainingCapacity();
                 continue;
             }
             if (std.mem.eql(u8, typ, "additional_tools")) {
@@ -127,12 +132,14 @@ pub fn parseResponses(allocator: std.mem.Allocator, body: std.json.Value) Outcom
             }
             if (std.mem.eql(u8, typ, "input_text") or role == null or std.mem.eql(u8, role.?, "user")) {
                 if (saw_tool_output) saw_later_user = true;
+                continuation.clearRetainingCapacity();
                 last_user.clearRetainingCapacity();
                 appendLine(&last_user, allocator, text) catch return oom();
                 appendNamed(&flatten, allocator, "user", text) catch return oom();
                 continue;
             }
             if (std.mem.eql(u8, role.?, "assistant")) {
+                continuation.clearRetainingCapacity();
                 appendNamed(&flatten, allocator, "assistant", text) catch return oom();
                 continue;
             }
@@ -267,6 +274,7 @@ fn parseTranscript(
             continue;
         }
         if (std.mem.eql(u8, role, "assistant")) {
+            continuation.clearRetainingCapacity();
             appendNamed(&flatten, allocator, "assistant", text) catch return oom();
             if (jsonx.asArray(jsonx.get(msg, "tool_calls") orelse .null)) |calls| {
                 for (calls) |call| {
@@ -560,6 +568,40 @@ test "responses continuation from function_call_output" {
     const out = parseResponses(arena.allocator(), parsed.value);
     try std.testing.expectEqual(@as(usize, 1), out.ok.continuation.len);
     try std.testing.expectEqualStrings("call_1", out.ok.continuation[0].call_id);
+}
+
+test "responses continuation keeps only the trailing function_call_output batch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(),
+        \\{"model":"grok-4.6","input":[{"type":"input_text","text":"hi"},{"type":"function_call","call_id":"call-05694079-2a65-43aa-89ce-d7a82c38f262-3","name":"list_dir","arguments":"{}"},{"type":"function_call_output","call_id":"call-05694079-2a65-43aa-89ce-d7a82c38f262-3","output":"ok"},{"type":"function_call","call_id":"call-5574c341-8c01-4501-8631-fa5859cdbd0a-4","name":"write","arguments":"{}"},{"type":"function_call_output","call_id":"call-5574c341-8c01-4501-8631-fa5859cdbd0a-4","output":"wrote"}]}
+    , .{});
+    const out = parseResponses(arena.allocator(), parsed.value);
+    try std.testing.expectEqual(@as(usize, 1), out.ok.continuation.len);
+    try std.testing.expectEqualStrings("call-5574c341-8c01-4501-8631-fa5859cdbd0a-4", out.ok.continuation[0].call_id);
+}
+
+test "responses continuation keeps parallel trailing function_call_outputs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(),
+        \\{"model":"grok-4.6","input":[{"type":"function_call","call_id":"c1","name":"list_dir","arguments":"{}"},{"type":"function_call","call_id":"c2","name":"write","arguments":"{}"},{"type":"function_call_output","call_id":"c1","output":"a"},{"type":"function_call_output","call_id":"c2","output":"b"}]}
+    , .{});
+    const out = parseResponses(arena.allocator(), parsed.value);
+    try std.testing.expectEqual(@as(usize, 2), out.ok.continuation.len);
+    try std.testing.expectEqualStrings("c1", out.ok.continuation[0].call_id);
+    try std.testing.expectEqualStrings("c2", out.ok.continuation[1].call_id);
+}
+
+test "messages continuation keeps only trailing tool results after the last assistant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(),
+        \\{"model":"grok-4.6","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"list_dir"}}]},{"role":"tool","tool_call_id":"c1","content":"ok"},{"role":"assistant","content":"","tool_calls":[{"id":"c2","type":"function","function":{"name":"write"}}]},{"role":"tool","tool_call_id":"c2","content":"wrote"}]}
+    , .{});
+    const out = parseMessages(arena.allocator(), parsed.value);
+    try std.testing.expectEqual(@as(usize, 1), out.ok.continuation.len);
+    try std.testing.expectEqualStrings("c2", out.ok.continuation[0].call_id);
 }
 
 test "messages requires model and messages" {
