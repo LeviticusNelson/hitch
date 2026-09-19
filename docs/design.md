@@ -55,6 +55,10 @@ Wire ids: accept `cursor-cidr/grok-4.6` (and siblings), strip prefix before Curs
 
 Reuse Node’s public error types: `invalid_request`, `authentication_error`, `rate_limited`, `cursor_session_lost`, `cursor_empty_turn`, `cursor_upstream_error`, `cursor_timeout`.
 
-## Milestone 0 (this commit)
+## Milestone 0 (landed)
 
-Listen on `127.0.0.1:8081`, `GET /health` JSON, compare script. No Cursor calls yet.
+Listen on `127.0.0.1:8081`, `GET /health` JSON, compare script.
+
+## Current (this tree)
+
+HTTP clone of the Grok-facing surface: models, account, messages, chat, responses, compact, local Grok compact-summary intercept. Cursor traffic uses official `cursor-sdk-bridge` 1.0.30 over Connect JSON when `CURSOR_API_KEY` and the binary are present; otherwise a fake driver so the HTTP contract can be tested without Cursor.
