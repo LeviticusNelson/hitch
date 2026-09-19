@@ -16,6 +16,7 @@ const jsonx = @import("jsonx.zig");
 const models = @import("models.zig");
 const protocol = @import("protocol.zig");
 const toolcb = @import("toolcb.zig");
+const rawhttp = @import("rawhttp.zig");
 
 const version = config_mod.version;
 
@@ -30,10 +31,12 @@ pub fn main(init: std.process.Init) !void {
     io.random(&secret);
 
     const instance = try ids.instanceId(io, arena, cfg.instance_id);
+    const gpa = std.heap.page_allocator;
     var catalog_store: cursor_api.Catalog = undefined;
+    var hub = toolcb.Hub.init(io, gpa);
     var app = httpx.App{
         .io = io,
-        .gpa = arena,
+        .gpa = gpa,
         .config = cfg,
         .compact = .{ .secret = secret, .now_secs = @intCast(@divTrunc(Io.Clock.real.now(io).nanoseconds, 1_000_000_000)) },
         .instance_id = instance,
@@ -46,8 +49,8 @@ pub fn main(init: std.process.Init) !void {
     if (cfg.cursor_api_key) |key| {
         catalog_store = .{
             .io = io,
-            .gpa = arena,
-            .client = .{ .allocator = arena, .io = io },
+            .gpa = gpa,
+            .client = .{ .allocator = gpa, .io = io },
             .api_key = key,
         };
         app.catalog = &catalog_store;
@@ -70,7 +73,8 @@ pub fn main(init: std.process.Init) !void {
             return err;
         };
         cb_server = try cb_addr.listen(io, .{ .reuse_address = true });
-        group.async(io, toolcb.acceptLoop, .{ io, &cb_server, cb_token, arena });
+        hub.token = cb_token;
+        group.async(io, toolcb.acceptLoop, .{ io, &cb_server, &hub });
         std.log.info("tool callback {s}", .{cb_url});
     }
 
@@ -79,7 +83,7 @@ pub fn main(init: std.process.Init) !void {
     if (!cfg.fake_cursor) {
         if (bridge.findBridgeBinary(init.environ_map, arena)) |bin| {
             if (cfg.cursor_api_key) |key| {
-                if (bridge.spawn(io, arena, init.environ_map, bin, cfg.workspace_dir, key, cb_url, cb_token)) |spawned| {
+                if (bridge.spawn(io, gpa, init.environ_map, bin, cfg.workspace_dir, key, cb_url, cb_token, &hub, &group)) |spawned| {
                     live_bridge = spawned;
                 } else |err| {
                     std.log.warn("official sdk-bridge spawn failed ({t}); catalog stays native, inference unavailable", .{err});
@@ -133,16 +137,24 @@ fn accept(io: Io, app: *httpx.App, stream: Io.net.Stream) void {
     var send_buffer: [16384]u8 = undefined;
     var conn_reader = stream.reader(io, &recv_buffer);
     var conn_writer = stream.writer(io, &send_buffer);
-    var server = std.http.Server.init(&conn_reader.interface, &conn_writer.interface);
-
-    var request = server.receiveHead() catch |err| switch (err) {
-        error.HttpConnectionClosing => return,
-        else => {
-            std.log.err("closing http connection: {t}", .{err});
-            return;
-        },
+    var arena_state = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const incoming = rawhttp.readIncoming(
+        &conn_reader.interface,
+        &conn_writer.interface,
+        arena,
+        256 * 1024,
+        app.config.max_body_bytes,
+    ) catch |err| {
+        std.log.err("http parse: {t}", .{err});
+        var reply_err = rawhttp.Reply{ .writer = &conn_writer.interface };
+        const msg = "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request\",\"message\":\"Invalid HTTP request\"}}\n";
+        reply_err.json(400, msg, &.{.{ .name = "content-type", .value = "application/json" }}) catch {};
+        return;
     };
-    httpx.handle(app, &request);
+    var reply = rawhttp.Reply{ .writer = &conn_writer.interface };
+    httpx.handle(app, incoming, &reply);
 }
 
 fn bridgeUnary(client: *httpx.BridgeClient, allocator: std.mem.Allocator, path: []const u8, payload: []const u8) anyerror![]u8 {
@@ -172,6 +184,7 @@ test {
     _ = cursor_api;
     _ = @import("session.zig");
     _ = toolcb;
+    _ = rawhttp;
 }
 
 fn pathOnly(target: []const u8) []const u8 {

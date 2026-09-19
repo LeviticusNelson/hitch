@@ -4,6 +4,7 @@ const encode = @import("encode.zig");
 const jsonx = @import("jsonx.zig");
 const models = @import("models.zig");
 const protocol = @import("protocol.zig");
+const toolcb = @import("toolcb.zig");
 
 pub const Sink = struct {
     ctx: *anyopaque = undefined,
@@ -21,7 +22,11 @@ pub const Bridge = struct {
     workspace: []const u8,
     child: ?std.process.Child = null,
     agents: std.StringHashMap([]const u8) = undefined,
+    lives: std.StringHashMap(*Live) = undefined,
+    hub: *toolcb.Hub,
+    group: *Io.Group,
     mu: Io.Mutex = .init,
+    last_err: []const u8 = "",
 
     pub fn unary(self: *Bridge, arena: std.mem.Allocator, path: []const u8, payload: []const u8) ![]u8 {
         const url = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.base_url, path });
@@ -81,30 +86,147 @@ pub const Bridge = struct {
         now: i64,
         sink: Sink,
     ) !encode.Turn {
+        if (parsed.continuation.len > 0) {
+            const live = self.liveForContinuation(session_id, parsed.continuation) orelse {
+                self.last_err = "Session is not waiting for tool results";
+                return error.SessionLost;
+            };
+            try self.applyContinuation(arena, live, parsed);
+            live.setSink(sink);
+            defer live.setSink(.{});
+            return self.waitBoundary(arena, live, parsed, message_id, session_id, now);
+        }
+
         const agent_id = try self.ensureAgent(arena, parsed, session_id);
-        const prompt = if (parsed.continuation.len > 0)
-            try formatToolResultsFn(arena, parsed)
-        else
-            clip(parsed.flatten_text, models.sdkPromptMaxCharsForModel(parsed.upstream_model));
-        const send_json = try std.fmt.allocPrint(arena,
+        const prompt = clip(parsed.flatten_text, models.sdkPromptMaxCharsForModel(parsed.upstream_model));
+        const send_json_tmp = try std.fmt.allocPrint(arena,
             "{{\"agentId\":{f},\"message\":{{\"text\":{f}}},\"options\":{{\"enableDeltas\":true}}}}",
             .{ std.json.fmt(agent_id, .{}), std.json.fmt(prompt, .{}) },
         );
-        var collected = Collected{};
-        try self.sendCollect(arena, send_json, sink, &collected);
-        var tools = try arena.alloc(encode.ToolCall, collected.tools.items.len);
-        for (collected.tools.items, 0..) |t, i| tools[i] = t;
-        const stop: []const u8 = if (collected.tools.items.len > 0) "tool_use" else "end_turn";
+        const live = try self.gpa.create(Live);
+        live.* = .{
+            .bridge = self,
+            .io = self.io,
+            .gpa = self.gpa,
+            .arena_state = std.heap.ArenaAllocator.init(self.gpa),
+            .send_json = try self.gpa.dupe(u8, send_json_tmp),
+            .sink = sink,
+            .agent_id = try self.gpa.dupe(u8, agent_id),
+            .session_id = try self.gpa.dupe(u8, session_id),
+            .catalog = try dupeTools(self.gpa, parsed.tools),
+        };
+        self.mu.lockUncancelable(self.io);
+        try self.lives.put(live.session_id, live);
+        self.mu.unlock(self.io);
+        self.group.async(self.io, sendLoop, .{live});
+        defer live.setSink(.{});
+        return self.waitBoundary(arena, live, parsed, message_id, session_id, now);
+    }
+
+    fn getLive(self: *Bridge, session_id: []const u8) ?*Live {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return self.lives.get(session_id);
+    }
+
+    fn liveForContinuation(self: *Bridge, session_id: []const u8, continuation: []const protocol.ToolResult) ?*Live {
+        if (self.getLive(session_id)) |live| return live;
+        for (continuation) |c| {
+            const w = self.hub.get(c.call_id) orelse continue;
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+            var it = self.lives.valueIterator();
+            while (it.next()) |ptr| {
+                const live = ptr.*;
+                if (w.agent_id.len == 0 or live.agent_id.len == 0 or std.mem.eql(u8, live.agent_id, w.agent_id)) {
+                    return live;
+                }
+            }
+        }
+        return null;
+    }
+
+    fn applyContinuation(self: *Bridge, arena: std.mem.Allocator, live: *Live, parsed: protocol.Parsed) !void {
+        const pending = try self.hub.unresolvedIds(arena, live.agent_id);
+        var unknown = std.ArrayList([]const u8).empty;
+        var provided = std.StringHashMap(void).init(arena);
+        for (parsed.continuation) |c| {
+            try provided.put(c.call_id, {});
+            var found = false;
+            for (pending) |id| {
+                if (std.mem.eql(u8, id, c.call_id)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) try unknown.append(arena, c.call_id);
+        }
+        if (unknown.items.len > 0) {
+            self.last_err = try std.fmt.allocPrint(arena, "unknown tool_use_id: {s}", .{try joinIds(arena, unknown.items)});
+            return error.UnknownToolId;
+        }
+        var missing = std.ArrayList([]const u8).empty;
+        for (pending) |id| {
+            if (provided.get(id) == null) try missing.append(arena, id);
+        }
+        if (missing.items.len > 0) {
+            self.last_err = try std.fmt.allocPrint(arena, "missing tool_result for: {s}", .{try joinIds(arena, missing.items)});
+            return error.MissingToolResult;
+        }
+        live.resetSegment();
+        for (parsed.continuation) |c| {
+            if (!self.hub.fulfill(c.call_id, c.output)) {
+                self.last_err = try std.fmt.allocPrint(arena, "unknown tool_use_id: {s}", .{c.call_id});
+                return error.UnknownToolId;
+            }
+        }
+    }
+
+    fn waitBoundary(
+        self: *Bridge,
+        arena: std.mem.Allocator,
+        live: *Live,
+        parsed: protocol.Parsed,
+        message_id: []const u8,
+        session_id: []const u8,
+        now: i64,
+    ) !encode.Turn {
+        while (true) {
+            if (live.failed) return error.BridgeRpcFailed;
+            if (self.hub.unresolvedCount(live.agent_id) > 0) {
+                sleepMs(self.io, 50);
+                break;
+            }
+            if (live.finished) break;
+            sleepMs(self.io, 5);
+        }
+        const snaps = try self.hub.snapshotUnresolved(arena, live.agent_id);
+        live.mu.lockUncancelable(self.io);
+        const text = try arena.dupe(u8, live.text.items);
+        const thinking = try arena.dupe(u8, live.thinking.items);
+        live.mu.unlock(self.io);
+        var tools = try arena.alloc(encode.ToolCall, snaps.len);
+        for (snaps, 0..) |s, i| {
+            const restored = restoreTool(live.catalog, s.name);
+            tools[i] = .{
+                .id = s.call_id,
+                .name = restored.name,
+                .arguments = s.args_json,
+                .kind = restored.kind,
+                .namespace = restored.namespace,
+            };
+        }
+        const stop: []const u8 = if (tools.len > 0) "tool_use" else "end_turn";
         return .{
             .message_id = message_id,
             .session_id = session_id,
             .model = parsed.model,
             .created_at = now,
-            .text = try arena.dupe(u8, collected.text.items),
-            .thinking = try arena.dupe(u8, collected.thinking.items),
+            .text = text,
+            .thinking = thinking,
             .tools = tools,
             .input_tokens = protocol.estimateInputTokens(parsed),
-            .output_tokens = @max(@as(u32, 1), @as(u32, @intCast(@min(collected.text.items.len, 16_000) / 4))),
+            .output_tokens = @max(@as(u32, 1), @as(u32, @intCast(@min(text.len, 16_000) / 4))),
             .stop_reason = stop,
         };
     }
@@ -116,14 +238,16 @@ pub const Bridge = struct {
             return id;
         }
         self.mu.unlock(self.io);
+        const tools_field: []const u8 = if (parsed.tools.len > 0) ",\"tools\":{\"names\":[\"mcp\"]}" else "";
         const create = try std.fmt.allocPrint(arena,
-            "{{\"options\":{{\"model\":{{\"id\":{f}{s}}},\"apiKey\":{f},\"local\":{{\"cwd\":[{f}]{s}}},\"disallowedTools\":[\"shell\",\"read\",\"edit\",\"task\",\"webSearch\",\"webFetch\"]}}}}",
+            "{{\"options\":{{\"model\":{{\"id\":{f}{s}}},\"apiKey\":{f},\"local\":{{\"cwd\":[{f}]{s}}},\"disallowedTools\":[\"shell\",\"read\",\"edit\",\"task\",\"webSearch\",\"webFetch\"]{s}}}}}",
             .{
                 std.json.fmt(parsed.upstream_model, .{}),
                 try effortJson(arena, parsed.effort),
                 std.json.fmt(self.api_key, .{}),
                 std.json.fmt(self.workspace, .{}),
                 try customToolsJson(arena, parsed.tools),
+                tools_field,
             },
         );
         const created = try self.unary(arena, "/sdk.v1.SdkAgentService/CreateAgent", create);
@@ -137,7 +261,7 @@ pub const Bridge = struct {
         return durable;
     }
 
-    fn sendCollect(self: *Bridge, arena: std.mem.Allocator, send_json: []const u8, sink: Sink, collected: *Collected) !void {
+    fn sendCollect(self: *Bridge, arena: std.mem.Allocator, send_json: []const u8, live: *Live) !void {
         const framed = try frame(arena, send_json);
         const url = try std.fmt.allocPrint(arena, "{s}/sdk.v1.SdkAgentService/Send", .{self.base_url});
         const uri = try std.Uri.parse(url);
@@ -165,34 +289,63 @@ pub const Bridge = struct {
                 error.EndStream => break,
                 else => return err,
             } orelse break;
-            applyEnvelope(arena, payload, sink, collected) catch {};
+            applyEnvelope(arena, payload, live) catch {};
         }
     }
-
-    fn formatToolResults(_: *Bridge, arena: std.mem.Allocator, parsed: protocol.Parsed) ![]u8 {
-        return formatToolResultsFn(arena, parsed);
-    }
 };
 
-const Collected = struct {
+const Live = struct {
+    bridge: *Bridge,
+    io: Io,
+    gpa: std.mem.Allocator,
+    arena_state: std.heap.ArenaAllocator,
+    send_json: []u8,
+    sink: Sink = .{},
+    mu: Io.Mutex = .init,
     text: std.ArrayList(u8) = .empty,
     thinking: std.ArrayList(u8) = .empty,
-    tools: std.ArrayList(encode.ToolCall) = .empty,
+    finished: bool = false,
+    failed: bool = false,
+    agent_id: []u8,
+    session_id: []u8,
+    catalog: []protocol.Tool = &.{},
+
+    fn setSink(self: *Live, sink: Sink) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        self.sink = sink;
+    }
+
+    fn resetSegment(self: *Live) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        self.text.clearRetainingCapacity();
+        self.thinking.clearRetainingCapacity();
+        self.finished = false;
+        self.failed = false;
+    }
+
+    fn finish(self: *Live) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        self.finished = true;
+    }
+
+    fn fail(self: *Live) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        self.failed = true;
+        self.finished = true;
+    }
 };
 
-fn formatToolResultsFn(arena: std.mem.Allocator, parsed: protocol.Parsed) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    for (parsed.continuation) |c| {
-        try out.appendSlice(arena, "tool_result ");
-        try out.appendSlice(arena, c.call_id);
-        try out.appendSlice(arena, ": ");
-        try out.appendSlice(arena, c.output);
-        try out.append(arena, '\n');
-    }
-    if (parsed.last_user_text.len > 0) {
-        try out.appendSlice(arena, parsed.last_user_text);
-    }
-    return out.toOwnedSlice(arena);
+fn sendLoop(live: *Live) void {
+    const arena = live.arena_state.allocator();
+    live.bridge.sendCollect(arena, live.send_json, live) catch {
+        live.fail();
+        return;
+    };
+    live.finish();
 }
 
 fn effortJson(arena: std.mem.Allocator, effort: ?[]const u8) ![]const u8 {
@@ -237,7 +390,7 @@ fn readFrame(reader: *std.Io.Reader, arena: std.mem.Allocator) !?[]u8 {
     return payload;
 }
 
-fn applyEnvelope(arena: std.mem.Allocator, payload: []const u8, sink: Sink, collected: *Collected) !void {
+fn applyEnvelope(arena: std.mem.Allocator, payload: []const u8, live: *Live) !void {
     if (payload.len == 0 or payload[0] != '{') return;
     const parsed = std.json.parseFromSlice(std.json.Value, arena, payload, .{}) catch return;
     if (jsonx.get(parsed.value, "interactionUpdate")) |upd| {
@@ -248,11 +401,9 @@ fn applyEnvelope(arena: std.mem.Allocator, payload: []const u8, sink: Sink, coll
         };
         if (piece.len == 0) return;
         if (std.mem.eql(u8, typ, "text-delta") or std.mem.eql(u8, typ, "text_delta")) {
-            try collected.text.appendSlice(arena, piece);
-            if (sink.on_text) |fn_ptr| fn_ptr(sink.ctx, piece);
+            appendLive(live, .text, piece);
         } else if (std.mem.indexOf(u8, typ, "thinking") != null) {
-            try collected.thinking.appendSlice(arena, piece);
-            if (sink.on_thinking) |fn_ptr| fn_ptr(sink.ctx, piece);
+            appendLive(live, .thinking, piece);
         }
         return;
     }
@@ -261,32 +412,85 @@ fn applyEnvelope(arena: std.mem.Allocator, payload: []const u8, sink: Sink, coll
         const m = jsonx.get(msg, "message") orelse return;
         if (std.mem.eql(u8, typ, "assistant")) {
             const piece = jsonx.getStr(m, "text") orelse jsonx.collectText(m, arena) catch "";
-            if (piece.len > 0 and collected.text.items.len == 0) {
-                try collected.text.appendSlice(arena, piece);
-                if (sink.on_text) |fn_ptr| fn_ptr(sink.ctx, piece);
-            }
+            live.mu.lockUncancelable(live.io);
+            const empty = live.text.items.len == 0;
+            live.mu.unlock(live.io);
+            if (piece.len > 0 and empty) appendLive(live, .text, piece);
         } else if (std.mem.eql(u8, typ, "thinking")) {
             const piece = jsonx.getStr(m, "text") orelse jsonx.getStr(m, "thinking") orelse jsonx.collectText(m, arena) catch "";
-            if (piece.len > 0 and collected.thinking.items.len == 0) {
-                try collected.thinking.appendSlice(arena, piece);
-                if (sink.on_thinking) |fn_ptr| fn_ptr(sink.ctx, piece);
-            }
-        } else if (std.mem.eql(u8, typ, "tool_call")) {
-            const call_id = jsonx.getStr(m, "callId") orelse jsonx.getStr(m, "id") orelse jsonx.getStr(m, "toolCallId") orelse return;
-            const name = jsonx.getStr(m, "name") orelse jsonx.getStr(m, "toolName") orelse "";
-            const args = jsonx.getStr(m, "arguments") orelse jsonx.getStr(m, "input") orelse "{}";
-            try collected.tools.append(arena, .{ .id = call_id, .name = name, .arguments = args });
+            live.mu.lockUncancelable(live.io);
+            const empty = live.thinking.items.len == 0;
+            live.mu.unlock(live.io);
+            if (piece.len > 0 and empty) appendLive(live, .thinking, piece);
         }
         return;
     }
     if (jsonx.get(parsed.value, "result")) |res| {
         const inner = jsonx.get(res, "result") orelse res;
         const final_text = jsonx.getStr(inner, "text") orelse jsonx.getStr(inner, "result") orelse "";
-        if (final_text.len > 0 and collected.text.items.len == 0) {
-            try collected.text.appendSlice(arena, final_text);
-            if (sink.on_text) |fn_ptr| fn_ptr(sink.ctx, final_text);
+        live.mu.lockUncancelable(live.io);
+        const empty = live.text.items.len == 0;
+        live.mu.unlock(live.io);
+        if (final_text.len > 0 and empty) appendLive(live, .text, final_text);
+    }
+}
+
+const LiveKind = enum { text, thinking };
+
+fn appendLive(live: *Live, kind: LiveKind, piece: []const u8) void {
+    live.mu.lockUncancelable(live.io);
+    const sink = live.sink;
+    switch (kind) {
+        .text => live.text.appendSlice(live.gpa, piece) catch {},
+        .thinking => live.thinking.appendSlice(live.gpa, piece) catch {},
+    }
+    live.mu.unlock(live.io);
+    switch (kind) {
+        .text => if (sink.on_text) |fn_ptr| fn_ptr(sink.ctx, piece),
+        .thinking => if (sink.on_thinking) |fn_ptr| fn_ptr(sink.ctx, piece),
+    }
+}
+
+fn sleepMs(io: Io, ms: i64) void {
+    const d: Io.Clock.Duration = .{ .raw = .fromMilliseconds(ms), .clock = .real };
+    d.sleep(io) catch {};
+}
+
+fn joinIds(arena: std.mem.Allocator, ids: []const []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    for (ids, 0..) |id, i| {
+        if (i > 0) try out.append(arena, ',');
+        try out.appendSlice(arena, id);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+fn dupeTools(gpa: std.mem.Allocator, tools: []const protocol.Tool) ![]protocol.Tool {
+    const out = try gpa.alloc(protocol.Tool, tools.len);
+    for (tools, 0..) |t, i| {
+        out[i] = .{
+            .name = try gpa.dupe(u8, t.name),
+            .sdk_name = try gpa.dupe(u8, t.sdk_name),
+            .description = try gpa.dupe(u8, t.description),
+            .schema_json = try gpa.dupe(u8, t.schema_json),
+            .kind = t.kind,
+            .namespace = try gpa.dupe(u8, t.namespace),
+        };
+    }
+    return out;
+}
+
+fn restoreTool(catalog: []const protocol.Tool, sdk_name: []const u8) struct {
+    name: []const u8,
+    namespace: []const u8,
+    kind: protocol.ToolKind,
+} {
+    for (catalog) |t| {
+        if (std.mem.eql(u8, t.sdk_name, sdk_name) or std.mem.eql(u8, t.name, sdk_name)) {
+            return .{ .name = t.name, .namespace = t.namespace, .kind = t.kind };
         }
     }
+    return .{ .name = sdk_name, .namespace = "", .kind = .function };
 }
 
 fn clip(text: []const u8, max: u32) []const u8 {
@@ -313,6 +517,8 @@ pub fn spawn(
     api_key: []const u8,
     tool_callback_url: []const u8,
     tool_callback_token: []const u8,
+    hub: *toolcb.Hub,
+    group: *Io.Group,
 ) !Bridge {
     std.Io.Dir.cwd().createDirPath(io, workspace) catch {};
     const child = try std.process.spawn(io, .{
@@ -343,6 +549,9 @@ pub fn spawn(
         .workspace = workspace,
         .child = child,
         .agents = std.StringHashMap([]const u8).init(gpa),
+        .lives = std.StringHashMap(*Live).init(gpa),
+        .hub = hub,
+        .group = group,
     };
     _ = env;
     return br;

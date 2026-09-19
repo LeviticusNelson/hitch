@@ -13,6 +13,7 @@ pub const Tool = struct {
     description: []const u8,
     schema_json: []const u8,
     kind: ToolKind = .function,
+    namespace: []const u8 = "",
 };
 
 pub const ToolResult = struct {
@@ -109,10 +110,10 @@ pub fn parseResponses(allocator: std.mem.Allocator, body: std.json.Value) Outcom
             }
             if (std.mem.eql(u8, typ, "additional_tools")) {
                 if (jsonx.asArray(jsonx.get(item, "tools") orelse .null)) |more| {
-                    for (more) |t| parseResponsesTool(allocator, t, &tools_list) catch |err| {
+                    for (more) |t| parseAdditionalTool(allocator, t, &tools_list) catch |err| {
                         return switch (err) {
                             error.OutOfMemory => oom(),
-                            else => fail("unsupported additional_tools type"),
+                            else => fail("unsupported additional_tools type; only client-executed function, custom, and namespace tools are supported"),
                         };
                     };
                 } else return fail("additional_tools.tools must be an array");
@@ -318,6 +319,46 @@ pub fn estimateInputTokens(parsed: Parsed) u32 {
     return @max(@as(u32, 1), text + overhead);
 }
 
+fn parseAdditionalTool(allocator: std.mem.Allocator, tool: std.json.Value, tools: *std.ArrayList(Tool)) !void {
+    const typ = jsonx.getStr(tool, "type") orelse "function";
+    if (std.mem.eql(u8, typ, "namespace")) return parseNamespaceTools(allocator, tool, tools);
+    return parseResponsesTool(allocator, tool, tools);
+}
+
+fn parseNamespaceTools(allocator: std.mem.Allocator, tool: std.json.Value, tools: *std.ArrayList(Tool)) !void {
+    const ns = jsonx.getStr(tool, "name") orelse return error.BadTool;
+    if (ns.len == 0 or ns.len > 96 or !validToolName(ns)) return error.BadTool;
+    const children = jsonx.asArray(jsonx.get(tool, "tools") orelse .null) orelse return error.BadTool;
+    if (children.len == 0) return error.BadTool;
+    for (children) |child| {
+        try parseResponsesTool(allocator, child, tools);
+        var added = &tools.items[tools.items.len - 1];
+        added.namespace = ns;
+        if (std.mem.startsWith(u8, added.name, "mcp__") or qualifiedAlready(ns, added.name)) {
+            added.sdk_name = added.name;
+        } else {
+            added.sdk_name = try std.fmt.allocPrint(allocator, "{s}__{s}", .{ ns, added.name });
+        }
+        if (!validToolName(added.sdk_name)) return error.BadTool;
+        if (duplicateSdkName(tools.items[0 .. tools.items.len - 1], added.sdk_name)) {
+            _ = tools.pop();
+        }
+    }
+}
+
+fn qualifiedAlready(namespace: []const u8, name: []const u8) bool {
+    if (name.len < namespace.len + 2) return false;
+    if (!std.mem.startsWith(u8, name, namespace)) return false;
+    return name[namespace.len] == '_' and name[namespace.len + 1] == '_';
+}
+
+fn duplicateSdkName(existing: []const Tool, sdk_name: []const u8) bool {
+    for (existing) |t| {
+        if (std.mem.eql(u8, t.sdk_name, sdk_name) or std.mem.eql(u8, t.name, sdk_name)) return true;
+    }
+    return false;
+}
+
 fn parseResponsesTool(allocator: std.mem.Allocator, tool: std.json.Value, tools: *std.ArrayList(Tool)) !void {
     const typ = jsonx.getStr(tool, "type") orelse "function";
     if (std.mem.eql(u8, typ, "web_search") or std.mem.eql(u8, typ, "file_search") or
@@ -329,6 +370,7 @@ fn parseResponsesTool(allocator: std.mem.Allocator, tool: std.json.Value, tools:
     if (std.mem.eql(u8, typ, "custom")) {
         const name = jsonx.getStr(tool, "name") orelse return error.BadTool;
         if (!validToolName(name)) return error.BadTool;
+        if (duplicateSdkName(tools.items, name)) return;
         try tools.append(allocator, .{
             .name = name,
             .sdk_name = name,
@@ -346,6 +388,7 @@ fn parseResponsesTool(allocator: std.mem.Allocator, tool: std.json.Value, tools:
         jsonx.stringify(allocator, schema) catch return error.OutOfMemory
     else
         "{\"type\":\"object\",\"properties\":{}}";
+    if (duplicateSdkName(tools.items, name)) return;
     try tools.append(allocator, .{
         .name = name,
         .sdk_name = name,
@@ -493,6 +536,19 @@ test "responses accepts string input and strips prefix" {
     try std.testing.expectEqualStrings("grok-4.6", out.ok.upstream_model);
     try std.testing.expectEqualStrings("hello", out.ok.last_user_text);
     try std.testing.expect(out.ok.stream);
+}
+
+test "additional_tools namespace is qualified for the SDK" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(),
+        \\{"model":"grok-4.6","input":[{"type":"input_text","text":"hi"},{"type":"additional_tools","tools":[{"type":"namespace","name":"linear","tools":[{"type":"function","name":"list_issues","parameters":{"type":"object"}}]}]}]}
+    , .{});
+    const out = parseResponses(arena.allocator(), parsed.value);
+    try std.testing.expectEqual(@as(usize, 1), out.ok.tools.len);
+    try std.testing.expectEqualStrings("list_issues", out.ok.tools[0].name);
+    try std.testing.expectEqualStrings("linear__list_issues", out.ok.tools[0].sdk_name);
+    try std.testing.expectEqualStrings("linear", out.ok.tools[0].namespace);
 }
 
 test "responses continuation from function_call_output" {

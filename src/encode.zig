@@ -9,6 +9,7 @@ pub const ToolCall = struct {
     name: []const u8,
     arguments: []const u8,
     kind: protocol.ToolKind = .function,
+    namespace: []const u8 = "",
 };
 
 pub const Turn = struct {
@@ -64,6 +65,19 @@ pub fn healthJson(
     );
 }
 
+pub fn encodeInProgress(allocator: std.mem.Allocator, turn: Turn) ![]u8 {
+    const id = try ids.responseId(turn.message_id, allocator);
+    return std.fmt.allocPrint(allocator,
+        "{{\"id\":{f},\"object\":\"response\",\"created_at\":{d},\"status\":\"in_progress\",\"error\":null,\"incomplete_details\":null,\"model\":{f},\"output\":[],\"usage\":null,\"cursor_session_id\":{f}}}",
+        .{
+            std.json.fmt(id, .{}),
+            turn.created_at,
+            std.json.fmt(turn.model, .{}),
+            std.json.fmt(turn.session_id, .{}),
+        },
+    );
+}
+
 pub fn encodeResponse(allocator: std.mem.Allocator, turn: Turn) ![]u8 {
     const id = try ids.responseId(turn.message_id, allocator);
     const status: []const u8 = if (std.mem.eql(u8, turn.stop_reason, "tool_use")) "completed" else if (std.mem.eql(u8, turn.stop_reason, "max_tokens")) "incomplete" else "completed";
@@ -90,13 +104,13 @@ pub fn encodeResponse(allocator: std.mem.Allocator, turn: Turn) ![]u8 {
         const item_id = try ids.functionCallItemId(tool.id, allocator);
         if (tool.kind == .custom) {
             try output.appendSlice(allocator, try std.fmt.allocPrint(allocator,
-                "{{\"id\":{f},\"type\":\"custom_tool_call\",\"status\":\"completed\",\"call_id\":{f},\"name\":{f},\"input\":{f}}}",
-                .{ std.json.fmt(item_id, .{}), std.json.fmt(tool.id, .{}), std.json.fmt(tool.name, .{}), std.json.fmt(tool.arguments, .{}) },
+                "{{\"id\":{f},\"type\":\"custom_tool_call\",\"status\":\"completed\",\"call_id\":{f},\"name\":{f},\"input\":{f}{s}}}",
+                .{ std.json.fmt(item_id, .{}), std.json.fmt(tool.id, .{}), std.json.fmt(tool.name, .{}), std.json.fmt(tool.arguments, .{}), try namespaceJson(allocator, tool.namespace) },
             ));
         } else {
             try output.appendSlice(allocator, try std.fmt.allocPrint(allocator,
-                "{{\"id\":{f},\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":{f},\"name\":{f},\"arguments\":{f}}}",
-                .{ std.json.fmt(item_id, .{}), std.json.fmt(tool.id, .{}), std.json.fmt(tool.name, .{}), std.json.fmt(tool.arguments, .{}) },
+                "{{\"id\":{f},\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":{f},\"name\":{f},\"arguments\":{f}{s}}}",
+                .{ std.json.fmt(item_id, .{}), std.json.fmt(tool.id, .{}), std.json.fmt(tool.name, .{}), std.json.fmt(tool.arguments, .{}), try namespaceJson(allocator, tool.namespace) },
             ));
         }
     }
@@ -242,6 +256,11 @@ fn injectSequence(allocator: std.mem.Allocator, data_json: []const u8, event: []
 
 pub fn sseData(allocator: std.mem.Allocator, data_json: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "data: {s}\n\n", .{data_json});
+}
+
+fn namespaceJson(allocator: std.mem.Allocator, namespace: []const u8) ![]const u8 {
+    if (namespace.len == 0) return "";
+    return std.fmt.allocPrint(allocator, ",\"namespace\":{f}", .{std.json.fmt(namespace, .{})});
 }
 
 fn comma(out: *std.ArrayList(u8), allocator: std.mem.Allocator, first: *bool) !void {

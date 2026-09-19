@@ -13,6 +13,7 @@ const models = @import("models.zig");
 const protocol = @import("protocol.zig");
 const cursor_api = @import("cursor_api.zig");
 const bridge_mod = @import("bridge.zig");
+const rawhttp = @import("rawhttp.zig");
 
 pub const App = struct {
     io: Io,
@@ -33,26 +34,24 @@ pub const BridgeClient = struct {
     impl: *anyopaque,
 };
 
-pub fn handle(app: *App, request: *std.http.Server.Request) void {
+pub fn handle(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply) void {
     var arena_state = std.heap.ArenaAllocator.init(app.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    serve(app, request, arena) catch |err| {
+    serve(app, req, reply, arena) catch |err| {
         std.log.err("request failed: {t}", .{err});
-        const body = encode.publicErrorJson(arena, errors.upstreamError("internal error"), "req_unknown") catch return;
-        request.respond(body, .{
-            .status = .internal_server_error,
-            .keep_alive = false,
-            .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
-        }) catch {};
+        if (!reply.started) {
+            const body = encode.publicErrorJson(arena, errors.upstreamError("internal error"), "req_unknown") catch return;
+            reply.json(500, body, &.{.{ .name = "content-type", .value = "application/json" }}) catch {};
+        }
     };
 }
 
-fn serve(app: *App, request: *std.http.Server.Request, arena: std.mem.Allocator) !void {
-    var headers_buf: [48]std.http.Header = undefined;
-    const headers = copyHeaders(request, arena, &headers_buf) catch return error.OutOfMemory;
-    const path = canonicalizePath(pathOnly(request.head.target));
-    const method = request.head.method;
+fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem.Allocator) !void {
+    var headers_buf: [128]std.http.Header = undefined;
+    const headers = headerSet(req, &headers_buf);
+    const path = req.path;
+    const method = req.method;
     std.log.info("{s} {s}", .{ @tagName(method), path });
     const request_id = headers.get("x-request-id") orelse try ids.requestId(app.io, arena);
     const session_hint = headers.get("x-cursor-session-id");
@@ -62,10 +61,10 @@ fn serve(app: *App, request: *std.http.Server.Request, arena: std.mem.Allocator)
         const catalog_mode: []const u8 = if (app.catalog != null) "native" else "fake";
         const inference_mode: []const u8 = if (app.use_fake) "fake" else if (app.cursor_bridge != null) "sdk-bridge" else "unavailable";
         const body = try encode.healthJson(arena, config_mod.version, app.instance_id, app.sdk_version, true, catalog_mode, inference_mode);
-        return sendJson(request, .ok, body, request_id, null);
+        return sendJson(reply, .ok, body, request_id, null);
     }
 
-    const body_bytes = try readBody(request, arena, app.config.max_body_bytes);
+    const body_bytes = req.body;
 
     if (method == .GET and (std.mem.eql(u8, path, "/v1/models") or std.mem.eql(u8, path, "/v1/models-v2"))) {
         const authorized = auth.authorizeClient(headers, "127.0.0.1", .{
@@ -74,10 +73,10 @@ fn serve(app: *App, request: *std.http.Server.Request, arena: std.mem.Allocator)
             .managed_cursor_key = app.config.managed_cursor_key,
         });
         if (authorized == .err and app.config.auth_mode != .managed) {
-            return sendErr(request, authorized.err, request_id, path, false);
+            return sendErr(reply, authorized.err, request_id, path, false);
         }
         const json = try modelsJson(app, arena, user_agent);
-        return sendJson(request, .ok, json, request_id, null);
+        return sendJson(reply, .ok, json, request_id, null);
     }
 
     const authorized = auth.authorizeClient(headers, "127.0.0.1", .{
@@ -87,48 +86,44 @@ fn serve(app: *App, request: *std.http.Server.Request, arena: std.mem.Allocator)
     });
     const cred = switch (authorized) {
         .ok => |a| a,
-        .err => |e| return sendErr(request, e, request_id, path, false),
+        .err => |e| return sendErr(reply, e, request_id, path, false),
     };
     _ = cred;
 
     if (method == .GET and std.mem.eql(u8, path, "/v1/account")) {
         const json = try accountJson(app, arena);
-        return sendJson(request, .ok, json, request_id, null);
+        return sendJson(reply, .ok, json, request_id, null);
     }
 
     if (method == .OPTIONS) {
-        return request.respond("", .{
-            .status = .no_content,
-            .keep_alive = false,
-            .extra_headers = &.{
-                .{ .name = "access-control-allow-origin", .value = "*" },
-                .{ .name = "access-control-allow-headers", .value = "*" },
-                .{ .name = "access-control-allow-methods", .value = "GET,POST,OPTIONS" },
-            },
+        return reply.empty(204, &.{
+            .{ .name = "access-control-allow-origin", .value = "*" },
+            .{ .name = "access-control-allow-headers", .value = "*" },
+            .{ .name = "access-control-allow-methods", .value = "GET,POST,OPTIONS" },
         });
     }
 
     if (method != .POST) {
         std.log.warn("no route for {s} {s}", .{ @tagName(method), path });
-        return sendErr(request, errors.notFound("No route"), request_id, path, isOpenAi(path));
+        return sendErr(reply, errors.notFound("No route"), request_id, path, isOpenAi(path));
     }
 
     if (body_bytes.len == 0) {
-        return sendErr(request, errors.invalidRequest("JSON body is required"), request_id, path, isOpenAi(path));
+        return sendErr(reply, errors.invalidRequest("JSON body is required"), request_id, path, isOpenAi(path));
     }
     const parsed_json = std.json.parseFromSliceLeaky(std.json.Value, arena, body_bytes, .{}) catch {
-        return sendErr(request, errors.invalidRequest("Request body must be valid JSON"), request_id, path, isOpenAi(path));
+        return sendErr(reply, errors.invalidRequest("Request body must be valid JSON"), request_id, path, isOpenAi(path));
     };
 
     if (std.mem.eql(u8, path, "/v1/messages/count_tokens")) {
         const parsed = protocol.parseMessages(arena, parsed_json);
         const p = switch (parsed) {
             .ok => |v| v,
-            .err => |e| return sendErr(request, e, request_id, path, false),
+            .err => |e| return sendErr(reply, e, request_id, path, false),
         };
         const n = protocol.estimateInputTokens(p);
         const json = try std.fmt.allocPrint(arena, "{{\"input_tokens\":{d}}}", .{n});
-        return sendJson(request, .ok, json, request_id, null);
+        return sendJson(reply, .ok, json, request_id, null);
     }
 
     const parsed = if (std.mem.eql(u8, path, "/v1/messages"))
@@ -139,22 +134,29 @@ fn serve(app: *App, request: *std.http.Server.Request, arena: std.mem.Allocator)
         protocol.parseResponses(arena, parsed_json)
     else {
         std.log.warn("no route for {s} {s}", .{ @tagName(method), path });
-        return sendErr(request, errors.notFound("No route"), request_id, path, isOpenAi(path));
+        return sendErr(reply, errors.notFound("No route"), request_id, path, isOpenAi(path));
     };
     const p = switch (parsed) {
         .ok => |v| v,
-        .err => |e| return sendErr(request, e, request_id, path, isOpenAi(path)),
+        .err => |e| return sendErr(reply, e, request_id, path, isOpenAi(path)),
     };
+    std.log.info("{s} tools={d} continuation={d} stream={s} session={s}", .{
+        path,
+        p.tools.len,
+        p.continuation.len,
+        if (p.stream) "1" else "0",
+        session_hint orelse "-",
+    });
 
     if (isCompactPath(path) or p.compaction_trigger) {
         const compact_id = try ids.compactId(app.io, arena);
         const minted = app.compact.mint(arena, compact_id, p.model) catch {
-            return sendErr(request, errors.upstreamError("compact failed"), request_id, path, true);
+            return sendErr(reply, errors.upstreamError("compact failed"), request_id, path, true);
         };
         const sid = session_hint orelse try ids.sessionId(app.io, arena);
         const json = try encode.encodeCompaction(arena, minted.compact_id, minted.token, p.model, unixNow(app.io), sid, protocol.estimateInputTokens(p));
-        if (!p.stream) return sendJson(request, .ok, json, request_id, sid);
-        return writeCompactSse(request, arena, json, request_id, sid);
+        if (!p.stream) return sendJson(reply, .ok, json, request_id, sid);
+        return writeCompactSse(reply, arena, json, request_id, sid);
     }
 
     if (grok_summary.isGrokCompactSummaryRequest(p)) {
@@ -170,7 +172,7 @@ fn serve(app: *App, request: *std.http.Server.Request, arena: std.mem.Allocator)
             .input_tokens = protocol.estimateInputTokens(p),
             .output_tokens = 16,
         };
-        return writeTurn(request, arena, p, turn, request_id);
+        return writeTurn(reply, arena, p, turn, request_id);
     }
 
     const sid = session_hint orelse try ids.sessionId(app.io, arena);
@@ -179,11 +181,11 @@ fn serve(app: *App, request: *std.http.Server.Request, arena: std.mem.Allocator)
 
     if (app.use_fake) {
         const turn = try engine.Fake.run(arena, p, sid, mid, now);
-        return writeTurn(request, arena, p, turn, request_id);
+        return writeTurn(reply, arena, p, turn, request_id);
     }
     const br = app.cursor_bridge orelse {
         return sendErr(
-            request,
+            reply,
             errors.upstreamError("Cursor local inference needs official cursor-sdk-bridge (Bun-compiled SDK). The Grok HTTP stack is Zig; Cursor does not publish a Zig executor. Set CURSOR_SDK_BRIDGE or run scripts/fetch-bridge.sh."),
             request_id,
             path,
@@ -192,73 +194,96 @@ fn serve(app: *App, request: *std.http.Server.Request, arena: std.mem.Allocator)
     };
 
     if (!p.stream) {
-        const turn = try br.runStreaming(arena, p, sid, mid, now, .{});
-        return writeTurn(request, arena, p, turn, request_id);
+        const turn = (try runBridge(br, arena, p, sid, mid, now, .{}, reply, request_id, path)) orelse return;
+        return writeTurn(reply, arena, p, turn, request_id);
     }
 
-    var buf: [2048]u8 = undefined;
-    var body = try request.respondStreaming(&buf, .{
-        .respond_options = .{
-            .keep_alive = false,
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
-                .{ .name = "cache-control", .value = "no-cache, no-transform" },
-                .{ .name = "x-accel-buffering", .value = "no" },
-                .{ .name = "x-request-id", .value = request_id },
-                .{ .name = "x-cursor-session-id", .value = sid },
-            },
-        },
+    try reply.beginSse(&.{
+        .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
+        .{ .name = "x-request-id", .value = request_id },
+        .{ .name = "x-cursor-session-id", .value = sid },
     });
     var seq: u32 = 0;
-    var box = SseBox{ .body = &body, .arena = arena, .seq = &seq, .kind = p.kind };
+    var box = SseBox{ .body = reply, .arena = arena, .seq = &seq, .kind = p.kind, .message_id = mid };
     if (p.kind == .responses) {
-        try writeSse(&body, try encode.sseEvent(arena, "response.created", "{\"response\":{\"status\":\"in_progress\"}}", seq));
+        const created_payload = try wrapInProgress(arena, mid, sid, p.model, now);
+        try writeSse(reply, try encode.sseEvent(arena, "response.created", created_payload, seq));
         seq += 1;
-        try writeSse(&body, try encode.sseEvent(arena, "response.in_progress", "{\"response\":{\"status\":\"in_progress\"}}", seq));
+        try writeSse(reply, try encode.sseEvent(arena, "response.in_progress", created_payload, seq));
         seq += 1;
     } else if (p.kind == .messages) {
-        try writeSse(&body, try encode.sseEvent(arena, "message_start", try std.fmt.allocPrint(arena,
+        try writeSse(reply, try encode.sseEvent(arena, "message_start", try std.fmt.allocPrint(arena,
             "{{\"type\":\"message_start\",\"message\":{{\"id\":{f},\"type\":\"message\",\"role\":\"assistant\",\"model\":{f},\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}},\"cursor_session_id\":{f}}}}}",
             .{ std.json.fmt(mid, .{}), std.json.fmt(p.model, .{}), std.json.fmt(sid, .{}) },
         ), 0));
         seq += 1;
     }
-    const turn = try br.runStreaming(arena, p, sid, mid, now, .{
+    const turn = (try runBridge(br, arena, p, sid, mid, now, .{
         .ctx = &box,
         .on_text = sseOnText,
         .on_thinking = sseOnThinking,
-    });
+    }, reply, request_id, path)) orelse return;
+    if (turn.tools.len > 0) try writeFunctionCallSse(reply, arena, turn, &seq, box.next_output);
     switch (p.kind) {
         .responses => {
             const json = try encode.encodeResponse(arena, turn);
-            try writeSse(&body, try encode.sseEvent(arena, "response.completed", try std.fmt.allocPrint(arena, "{{\"response\":{s}}}", .{json}), seq));
+            try writeSse(reply, try encode.sseEvent(arena, "response.completed", try std.fmt.allocPrint(arena, "{{\"response\":{s}}}", .{json}), seq));
         },
         .messages => {
             const stop: []const u8 = if (turn.tools.len > 0) "tool_use" else "end_turn";
-            try writeSse(&body, try std.fmt.allocPrint(arena, "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":{d}}}}}\n\n", .{ stop, turn.output_tokens }));
-            try writeSse(&body, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+            try writeSse(reply, try std.fmt.allocPrint(arena, "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":{d}}}}}\n\n", .{ stop, turn.output_tokens }));
+            try writeSse(reply, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
         },
         .chat => {
-            try writeChatSse(&body, arena, turn, p.include_usage);
+            try writeChatSse(reply, arena, turn, p.include_usage);
         },
     }
-    try body.end();
+    try reply.end();
 }
 
 const SseBox = struct {
-    body: *std.http.BodyWriter,
+    body: *rawhttp.Reply,
     arena: std.mem.Allocator,
     seq: *u32,
     kind: protocol.Kind,
+    message_id: []const u8 = "",
+    opened_reasoning: bool = false,
+    opened_message: bool = false,
+    next_output: u32 = 0,
+    reason_index: u32 = 0,
+    message_index: u32 = 0,
 };
+
+fn boxEmit(box: *SseBox, event: []const u8, data_json: []const u8) void {
+    const ev = encode.sseEvent(box.arena, event, data_json, box.seq.*) catch return;
+    writeSse(box.body, ev) catch return;
+    box.seq.* += 1;
+}
 
 fn sseOnText(ctx: *anyopaque, piece: []const u8) void {
     const box: *SseBox = @ptrCast(@alignCast(ctx));
     if (piece.len == 0) return;
     if (box.kind == .responses) {
-        const ev = encode.sseEvent(box.arena, "response.output_text.delta", std.fmt.allocPrint(box.arena, "{{\"delta\":{f}}}", .{std.json.fmt(piece, .{})}) catch return, box.seq.*) catch return;
-        writeSse(box.body, ev) catch return;
-        box.seq.* += 1;
+        if (!box.opened_message) {
+            box.opened_message = true;
+            box.message_index = box.next_output;
+            box.next_output += 1;
+            const added = std.fmt.allocPrint(box.arena,
+                "{{\"output_index\":{d},\"item\":{{\"id\":{f},\"type\":\"message\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}}}}",
+                .{ box.message_index, std.json.fmt(box.message_id, .{}) },
+            ) catch return;
+            boxEmit(box, "response.output_item.added", added);
+            const part = std.fmt.allocPrint(box.arena,
+                "{{\"item_id\":{f},\"output_index\":{d},\"content_index\":0,\"part\":{{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}}}",
+                .{ std.json.fmt(box.message_id, .{}), box.message_index },
+            ) catch return;
+            boxEmit(box, "response.content_part.added", part);
+        }
+        const data = std.fmt.allocPrint(box.arena,
+            "{{\"item_id\":{f},\"output_index\":{d},\"content_index\":0,\"delta\":{f}}}",
+            .{ std.json.fmt(box.message_id, .{}), box.message_index, std.json.fmt(piece, .{}) },
+        ) catch return;
+        boxEmit(box, "response.output_text.delta", data);
     } else if (box.kind == .messages) {
         const ev = std.fmt.allocPrint(box.arena, "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{f}}}}}\n\n", .{std.json.fmt(piece, .{})}) catch return;
         writeSse(box.body, ev) catch return;
@@ -269,61 +294,184 @@ fn sseOnThinking(ctx: *anyopaque, piece: []const u8) void {
     const box: *SseBox = @ptrCast(@alignCast(ctx));
     if (piece.len == 0) return;
     if (box.kind == .responses) {
-        const ev = encode.sseEvent(box.arena, "response.reasoning_summary_text.delta", std.fmt.allocPrint(box.arena, "{{\"delta\":{f}}}", .{std.json.fmt(piece, .{})}) catch return, box.seq.*) catch return;
-        writeSse(box.body, ev) catch return;
-        box.seq.* += 1;
+        const item_id = ids.reasoningItemId(box.message_id, box.arena) catch return;
+        if (!box.opened_reasoning) {
+            box.opened_reasoning = true;
+            box.reason_index = box.next_output;
+            box.next_output += 1;
+            const added = std.fmt.allocPrint(box.arena,
+                "{{\"output_index\":{d},\"item\":{{\"id\":{f},\"type\":\"reasoning\",\"summary\":[]}}}}",
+                .{ box.reason_index, std.json.fmt(item_id, .{}) },
+            ) catch return;
+            boxEmit(box, "response.output_item.added", added);
+            const part = std.fmt.allocPrint(box.arena,
+                "{{\"item_id\":{f},\"output_index\":{d},\"summary_index\":0,\"part\":{{\"type\":\"summary_text\",\"text\":\"\"}}}}",
+                .{ std.json.fmt(item_id, .{}), box.reason_index },
+            ) catch return;
+            boxEmit(box, "response.reasoning_summary_part.added", part);
+        }
+        const data = std.fmt.allocPrint(box.arena,
+            "{{\"item_id\":{f},\"output_index\":{d},\"summary_index\":0,\"delta\":{f}}}",
+            .{ std.json.fmt(item_id, .{}), box.reason_index, std.json.fmt(piece, .{}) },
+        ) catch return;
+        boxEmit(box, "response.reasoning_summary_text.delta", data);
     }
 }
 
-fn writeTurn(request: *std.http.Server.Request, arena: std.mem.Allocator, parsed: protocol.Parsed, turn: encode.Turn, request_id: []const u8) !void {
+fn runBridge(
+    br: *bridge_mod.Bridge,
+    arena: std.mem.Allocator,
+    parsed: protocol.Parsed,
+    session_id: []const u8,
+    message_id: []const u8,
+    now: i64,
+    sink: bridge_mod.Sink,
+    reply: *rawhttp.Reply,
+    request_id: []const u8,
+    path: []const u8,
+) !?encode.Turn {
+    return br.runStreaming(arena, parsed, session_id, message_id, now, sink) catch |err| {
+        const msg = if (br.last_err.len > 0) br.last_err else @errorName(err);
+        const gw = switch (err) {
+            error.UnknownToolId, error.MissingToolResult => errors.invalidRequest(msg),
+            error.SessionLost => errors.sessionLost(msg),
+            else => return err,
+        };
+        if (reply.started) {
+            const json = try encode.publicErrorJson(arena, gw, request_id);
+            try writeSse(reply, try encode.sseEvent(arena, "error", json, 0));
+            try reply.end();
+            return null;
+        }
+        try sendErr(reply, gw, request_id, path, isOpenAi(path));
+        return null;
+    };
+}
+
+fn writeFunctionCallSse(reply: *rawhttp.Reply, arena: std.mem.Allocator, turn: encode.Turn, seq: *u32, start_index: u32) !void {
+    var output_index = start_index;
+    for (turn.tools) |tool| {
+        const item_id = try ids.functionCallItemId(tool.id, arena);
+        const ns = if (tool.namespace.len > 0)
+            try std.fmt.allocPrint(arena, ",\"namespace\":{f}", .{std.json.fmt(tool.namespace, .{})})
+        else
+            "";
+        if (tool.kind == .custom) {
+            try writeSse(reply, try encode.sseEvent(arena, "response.output_item.added", try std.fmt.allocPrint(arena,
+                "{{\"output_index\":{d},\"item\":{{\"id\":{f},\"type\":\"custom_tool_call\",\"status\":\"in_progress\",\"call_id\":{f},\"name\":{f},\"input\":\"\"}}}}",
+                .{ output_index, std.json.fmt(item_id, .{}), std.json.fmt(tool.id, .{}), std.json.fmt(tool.name, .{}) },
+            ), seq.*));
+            seq.* += 1;
+            try writeSse(reply, try encode.sseEvent(arena, "response.custom_tool_call_input.done", try std.fmt.allocPrint(arena,
+                "{{\"item_id\":{f},\"output_index\":{d},\"input\":{f}{s}}}",
+                .{ std.json.fmt(item_id, .{}), output_index, std.json.fmt(tool.arguments, .{}), ns },
+            ), seq.*));
+            seq.* += 1;
+        } else {
+            try writeSse(reply, try encode.sseEvent(arena, "response.output_item.added", try std.fmt.allocPrint(arena,
+                "{{\"output_index\":{d},\"item\":{{\"id\":{f},\"type\":\"function_call\",\"status\":\"in_progress\",\"call_id\":{f},\"name\":{f},\"arguments\":\"\"}}}}",
+                .{ output_index, std.json.fmt(item_id, .{}), std.json.fmt(tool.id, .{}), std.json.fmt(tool.name, .{}) },
+            ), seq.*));
+            seq.* += 1;
+            try writeSse(reply, try encode.sseEvent(arena, "response.function_call_arguments.delta", try std.fmt.allocPrint(arena,
+                "{{\"item_id\":{f},\"output_index\":{d},\"delta\":{f}}}",
+                .{ std.json.fmt(item_id, .{}), output_index, std.json.fmt(tool.arguments, .{}) },
+            ), seq.*));
+            seq.* += 1;
+            try writeSse(reply, try encode.sseEvent(arena, "response.function_call_arguments.done", try std.fmt.allocPrint(arena,
+                "{{\"item_id\":{f},\"output_index\":{d},\"name\":{f},\"arguments\":{f}{s}}}",
+                .{ std.json.fmt(item_id, .{}), output_index, std.json.fmt(tool.name, .{}), std.json.fmt(tool.arguments, .{}), ns },
+            ), seq.*));
+            seq.* += 1;
+        }
+        if (tool.kind == .custom) {
+            try writeSse(reply, try encode.sseEvent(arena, "response.output_item.done", try std.fmt.allocPrint(arena,
+                "{{\"output_index\":{d},\"item\":{{\"id\":{f},\"type\":\"custom_tool_call\",\"status\":\"completed\",\"call_id\":{f},\"name\":{f},\"input\":{f}{s}}}}}",
+                .{ output_index, std.json.fmt(item_id, .{}), std.json.fmt(tool.id, .{}), std.json.fmt(tool.name, .{}), std.json.fmt(tool.arguments, .{}), ns },
+            ), seq.*));
+        } else {
+            try writeSse(reply, try encode.sseEvent(arena, "response.output_item.done", try std.fmt.allocPrint(arena,
+                "{{\"output_index\":{d},\"item\":{{\"id\":{f},\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":{f},\"name\":{f},\"arguments\":{f}{s}}}}}",
+                .{ output_index, std.json.fmt(item_id, .{}), std.json.fmt(tool.id, .{}), std.json.fmt(tool.name, .{}), std.json.fmt(tool.arguments, .{}), ns },
+            ), seq.*));
+        }
+        seq.* += 1;
+        output_index += 1;
+    }
+}
+
+fn writeTurn(reply: *rawhttp.Reply, arena: std.mem.Allocator, parsed: protocol.Parsed, turn: encode.Turn, request_id: []const u8) !void {
     if (!parsed.stream) {
         const json = switch (parsed.kind) {
             .responses => try encode.encodeResponse(arena, turn),
             .messages => try encode.encodeMessage(arena, turn),
             .chat => try encode.encodeChat(arena, turn),
         };
-        return sendJson(request, .ok, json, request_id, turn.session_id);
+        return sendJson(reply, .ok, json, request_id, turn.session_id);
     }
-    var buf: [2048]u8 = undefined;
-    var body = try request.respondStreaming(&buf, .{
-        .respond_options = .{
-            .keep_alive = false,
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
-                .{ .name = "cache-control", .value = "no-cache, no-transform" },
-                .{ .name = "x-accel-buffering", .value = "no" },
-                .{ .name = "x-request-id", .value = request_id },
-                .{ .name = "x-cursor-session-id", .value = turn.session_id },
-            },
-        },
+    try reply.beginSse(&.{
+        .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
+        .{ .name = "x-request-id", .value = request_id },
+        .{ .name = "x-cursor-session-id", .value = turn.session_id },
     });
     switch (parsed.kind) {
-        .responses => try writeResponsesSse(&body, arena, turn),
-        .messages => try writeMessagesSse(&body, arena, turn),
-        .chat => try writeChatSse(&body, arena, turn, parsed.include_usage),
+        .responses => try writeResponsesSse(reply, arena, turn),
+        .messages => try writeMessagesSse(reply, arena, turn),
+        .chat => try writeChatSse(reply, arena, turn, parsed.include_usage),
     }
-    try body.end();
+    try reply.end();
 }
 
-fn writeResponsesSse(body: *std.http.BodyWriter, arena: std.mem.Allocator, turn: encode.Turn) !void {
+fn wrapInProgress(arena: std.mem.Allocator, message_id: []const u8, session_id: []const u8, model: []const u8, now: i64) ![]u8 {
+    const inner = try encode.encodeInProgress(arena, .{
+        .message_id = message_id,
+        .session_id = session_id,
+        .model = model,
+        .created_at = now,
+        .text = "",
+    });
+    return std.fmt.allocPrint(arena, "{{\"response\":{s}}}", .{inner});
+}
+
+fn writeResponsesSse(body: *rawhttp.Reply, arena: std.mem.Allocator, turn: encode.Turn) !void {
     const json = try encode.encodeResponse(arena, turn);
     var seq: u32 = 0;
-    try writeSse(body, try encode.sseEvent(arena, "response.created", "{\"response\":{\"status\":\"in_progress\"}}", seq));
+    const created_payload = try wrapInProgress(arena, turn.message_id, turn.session_id, turn.model, turn.created_at);
+    try writeSse(body, try encode.sseEvent(arena, "response.created", created_payload, seq));
     seq += 1;
-    try writeSse(body, try encode.sseEvent(arena, "response.in_progress", "{\"response\":{\"status\":\"in_progress\"}}", seq));
+    try writeSse(body, try encode.sseEvent(arena, "response.in_progress", created_payload, seq));
     seq += 1;
+    var output_index: u32 = 0;
     if (turn.thinking.len > 0) {
-        try writeSse(body, try encode.sseEvent(arena, "response.reasoning_summary_text.delta", try std.fmt.allocPrint(arena, "{{\"delta\":{f}}}", .{std.json.fmt(turn.thinking, .{})}), seq));
+        const rs = try ids.reasoningItemId(turn.message_id, arena);
+        try writeSse(body, try encode.sseEvent(arena, "response.output_item.added", try std.fmt.allocPrint(arena,
+            "{{\"output_index\":{d},\"item\":{{\"id\":{f},\"type\":\"reasoning\",\"summary\":[]}}}}",
+            .{ output_index, std.json.fmt(rs, .{}) },
+        ), seq));
         seq += 1;
+        try writeSse(body, try encode.sseEvent(arena, "response.reasoning_summary_text.delta", try std.fmt.allocPrint(arena,
+            "{{\"item_id\":{f},\"output_index\":{d},\"summary_index\":0,\"delta\":{f}}}",
+            .{ std.json.fmt(rs, .{}), output_index, std.json.fmt(turn.thinking, .{}) },
+        ), seq));
+        seq += 1;
+        output_index += 1;
     }
     if (turn.text.len > 0) {
-        try writeSse(body, try encode.sseEvent(arena, "response.output_text.delta", try std.fmt.allocPrint(arena, "{{\"delta\":{f}}}", .{std.json.fmt(turn.text, .{})}), seq));
+        try writeSse(body, try encode.sseEvent(arena, "response.output_item.added", try std.fmt.allocPrint(arena,
+            "{{\"output_index\":{d},\"item\":{{\"id\":{f},\"type\":\"message\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}}}}",
+            .{ output_index, std.json.fmt(turn.message_id, .{}) },
+        ), seq));
+        seq += 1;
+        try writeSse(body, try encode.sseEvent(arena, "response.output_text.delta", try std.fmt.allocPrint(arena,
+            "{{\"item_id\":{f},\"output_index\":{d},\"content_index\":0,\"delta\":{f}}}",
+            .{ std.json.fmt(turn.message_id, .{}), output_index, std.json.fmt(turn.text, .{}) },
+        ), seq));
         seq += 1;
     }
     try writeSse(body, try encode.sseEvent(arena, "response.completed", try std.fmt.allocPrint(arena, "{{\"response\":{s}}}", .{json}), seq));
 }
 
-fn writeMessagesSse(body: *std.http.BodyWriter, arena: std.mem.Allocator, turn: encode.Turn) !void {
+fn writeMessagesSse(body: *rawhttp.Reply, arena: std.mem.Allocator, turn: encode.Turn) !void {
     try writeSse(body, try encode.sseEvent(arena, "message_start", try std.fmt.allocPrint(arena,
         "{{\"type\":\"message_start\",\"message\":{{\"id\":{f},\"type\":\"message\",\"role\":\"assistant\",\"model\":{f},\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}},\"cursor_session_id\":{f}}}}}",
         .{ std.json.fmt(turn.message_id, .{}), std.json.fmt(turn.model, .{}), std.json.fmt(turn.session_id, .{}) },
@@ -350,7 +498,7 @@ fn writeMessagesSse(body: *std.http.BodyWriter, arena: std.mem.Allocator, turn: 
     try writeSse(body, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
 }
 
-fn writeChatSse(body: *std.http.BodyWriter, arena: std.mem.Allocator, turn: encode.Turn, include_usage: bool) !void {
+fn writeChatSse(body: *rawhttp.Reply, arena: std.mem.Allocator, turn: encode.Turn, include_usage: bool) !void {
     const id = try ids.chatCompletionId(turn.message_id, arena);
     try writeSse(body, try encode.sseData(arena, try std.fmt.allocPrint(arena,
         "{{\"id\":{f},\"object\":\"chat.completion.chunk\",\"created\":{d},\"model\":{f},\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}",
@@ -382,26 +530,19 @@ fn writeChatSse(body: *std.http.BodyWriter, arena: std.mem.Allocator, turn: enco
     try writeSse(body, "data: [DONE]\n\n");
 }
 
-fn writeCompactSse(request: *std.http.Server.Request, arena: std.mem.Allocator, json: []const u8, request_id: []const u8, session_id: []const u8) !void {
-    var buf: [1024]u8 = undefined;
-    var body = try request.respondStreaming(&buf, .{
-        .respond_options = .{
-            .keep_alive = false,
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
-                .{ .name = "x-request-id", .value = request_id },
-                .{ .name = "x-cursor-session-id", .value = session_id },
-            },
-        },
+fn writeCompactSse(reply: *rawhttp.Reply, arena: std.mem.Allocator, json: []const u8, request_id: []const u8, session_id: []const u8) !void {
+    try reply.beginSse(&.{
+        .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
+        .{ .name = "x-request-id", .value = request_id },
+        .{ .name = "x-cursor-session-id", .value = session_id },
     });
-    try writeSse(&body, try encode.sseEvent(arena, "response.created", "{\"response\":{\"status\":\"in_progress\"}}", 0));
-    try writeSse(&body, try encode.sseEvent(arena, "response.completed", try std.fmt.allocPrint(arena, "{{\"response\":{s}}}", .{json}), 1));
-    try body.end();
+    try writeSse(reply, try encode.sseEvent(arena, "response.created", try std.fmt.allocPrint(arena, "{{\"response\":{s}}}", .{json}), 0));
+    try writeSse(reply, try encode.sseEvent(arena, "response.completed", try std.fmt.allocPrint(arena, "{{\"response\":{s}}}", .{json}), 1));
+    try reply.end();
 }
 
-fn writeSse(body: *std.http.BodyWriter, bytes: []const u8) !void {
-    try body.writer.writeAll(bytes);
-    try body.flush();
+fn writeSse(body: *rawhttp.Reply, bytes: []const u8) !void {
+    try body.writeAll(bytes);
 }
 
 fn modelsJson(app: *App, arena: std.mem.Allocator, user_agent: ?[]const u8) ![]u8 {
@@ -428,7 +569,7 @@ fn modelsJson(app: *App, arena: std.mem.Allocator, user_agent: ?[]const u8) ![]u
             if (!first) try out.append(arena, ',');
             first = false;
             try out.appendSlice(arena, try std.fmt.allocPrint(arena,
-                "{{\"id\":{f},\"object\":\"model\",\"display_name\":{f},\"description\":{f},\"context_tokens\":{d},\"compact_max_chars\":{d}}}",
+                "{{\"id\":{f},\"object\":\"model\",\"created\":0,\"display_name\":{f},\"description\":{f},\"context_tokens\":{d},\"compact_max_chars\":{d}}}",
                 .{
                     std.json.fmt(alias, .{}),
                     std.json.fmt(item.display_name, .{}),
@@ -467,45 +608,30 @@ fn accountJson(app: *App, arena: std.mem.Allocator) ![]u8 {
     );
 }
 
-fn sendJson(request: *std.http.Server.Request, status: std.http.Status, body: []const u8, request_id: []const u8, session_id: ?[]const u8) !void {
+fn sendJson(reply: *rawhttp.Reply, status: std.http.Status, body: []const u8, request_id: []const u8, session_id: ?[]const u8) !void {
     if (session_id) |sid| {
-        return request.respond(body, .{
-            .status = status,
-            .keep_alive = false,
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "application/json; charset=utf-8" },
-                .{ .name = "x-request-id", .value = request_id },
-                .{ .name = "cache-control", .value = "no-store" },
-                .{ .name = "x-cursor-session-id", .value = sid },
-            },
-        });
-    }
-    return request.respond(body, .{
-        .status = status,
-        .keep_alive = false,
-        .extra_headers = &.{
+        return reply.json(@intFromEnum(status), body, &.{
             .{ .name = "content-type", .value = "application/json; charset=utf-8" },
             .{ .name = "x-request-id", .value = request_id },
-            .{ .name = "cache-control", .value = "no-store" },
-        },
+            .{ .name = "x-cursor-session-id", .value = sid },
+        });
+    }
+    return reply.json(@intFromEnum(status), body, &.{
+        .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+        .{ .name = "x-request-id", .value = request_id },
     });
 }
 
-fn sendErr(request: *std.http.Server.Request, err: errors.Error, request_id: []const u8, path: []const u8, openai: bool) !void {
+fn sendErr(reply: *rawhttp.Reply, err: errors.Error, request_id: []const u8, path: []const u8, openai: bool) !void {
     _ = path;
     const json = if (openai)
         try encode.openaiError(std.heap.page_allocator, err, request_id)
     else
         try encode.publicErrorJson(std.heap.page_allocator, err, request_id);
     defer std.heap.page_allocator.free(json);
-    const status: std.http.Status = @enumFromInt(err.http_status);
-    try request.respond(json, .{
-        .status = status,
-        .keep_alive = false,
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "application/json; charset=utf-8" },
-            .{ .name = "x-request-id", .value = request_id },
-        },
+    try reply.json(err.http_status, json, &.{
+        .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+        .{ .name = "x-request-id", .value = request_id },
     });
 }
 
@@ -531,35 +657,12 @@ fn pathOnly(target: []const u8) []const u8 {
     return target[0..q];
 }
 
-fn canonicalizePath(path: []const u8) []const u8 {
-    var p = path;
-    while (std.mem.startsWith(u8, p, "/v1/v1/")) p = p[3..];
-    if (p.len > 1 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
-    return p;
-}
-
-fn copyHeaders(request: *std.http.Server.Request, arena: std.mem.Allocator, buf: []std.http.Header) !auth.HeaderSet {
-    var n: usize = 0;
-    var it = request.iterateHeaders();
-    while (it.next()) |h| {
-        if (n >= buf.len) break;
-        buf[n] = .{
-            .name = try arena.dupe(u8, h.name),
-            .value = try arena.dupe(u8, h.value),
-        };
-        n += 1;
+fn headerSet(req: rawhttp.Incoming, buf: []std.http.Header) auth.HeaderSet {
+    const n = @min(req.headers.len, buf.len);
+    for (req.headers[0..n], 0..) |h, i| {
+        buf[i] = .{ .name = h.name, .value = h.value };
     }
     return .{ .items = buf[0..n] };
-}
-
-fn readBody(request: *std.http.Server.Request, arena: std.mem.Allocator, max: usize) ![]u8 {
-    if (!request.head.method.requestHasBody()) return "";
-    var tmp: [4096]u8 = undefined;
-    const reader = try request.readerExpectContinue(&tmp);
-    return reader.allocRemaining(arena, .limited(max)) catch |err| switch (err) {
-        error.StreamTooLong => return error.StreamTooLong,
-        else => return err,
-    };
 }
 
 test "pathOnly strips query" {
