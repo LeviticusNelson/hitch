@@ -197,29 +197,38 @@ pub const Bridge = struct {
         session_id: []const u8,
         now: i64,
     ) !encode.Turn {
-        // Parallel CallCustomTool RPCs arrive a few dozen ms apart. Returning on
-        // the first announcement dropped siblings and Grok only saw part of the batch.
-        // Flush immediately on turn-ended (Node EventPump) so we do not wait out
-        // the settle window after Cursor has scheduled every execute callback.
+        // Parallel CallCustomTool RPCs arrive a few dozen ms apart. A tool that
+        // shows up after reasoning has already started streaming is still a
+        // tool_use boundary — returning end_turn here deadlocks Cursor on the
+        // held CallCustomTool. After the bridge stream ends, wait ~160ms for a
+        // straggler execute before closing with no tools.
         var last_n: usize = 0;
         var stable_ticks: u32 = 0;
+        var late_ticks: u32 = 0;
+        var logged_tools = false;
         while (true) {
             if (live.failed) return error.BridgeRpcFailed;
+            const finished = live.finished or live.batchReady();
             const n = self.hub.unresolvedCount(live.agent_id);
-            if (n > 0) {
-                if (live.batchReady()) break;
-                if (n == last_n) {
-                    stable_ticks += 1;
-                    if (stable_ticks >= 8) break; // ~160ms with no new tools
-                } else {
-                    last_n = n;
-                    stable_ticks = 0;
-                }
-                sleepMs(self.io, 20);
-                continue;
+            if (n > 0 and !logged_tools) {
+                std.log.info("waitBoundary tools n={d} finished={d} agent={s}", .{
+                    n,
+                    @intFromBool(finished),
+                    live.agent_id,
+                });
+                logged_tools = true;
             }
-            if (live.finished) break;
-            sleepMs(self.io, 5);
+            if (n != last_n) {
+                last_n = n;
+                stable_ticks = 0;
+                late_ticks = 0;
+            } else if (n > 0) {
+                stable_ticks += 1;
+            } else if (finished) {
+                late_ticks += 1;
+            }
+            if (protocol.waitBoundaryDone(n, finished, stable_ticks, late_ticks)) break;
+            sleepMs(self.io, if (n > 0 or finished) 20 else 5);
         }
         const snaps = try self.hub.snapshotUnresolved(arena, live.agent_id);
         live.replacePublished(snaps) catch {};

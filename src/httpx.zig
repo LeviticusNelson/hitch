@@ -52,7 +52,9 @@ fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
     const headers = headerSet(req, &headers_buf);
     const path = req.path;
     const method = req.method;
-    std.log.info("{s} {s}", .{ @tagName(method), path });
+    if (!(method == .GET and std.mem.eql(u8, path, "/health"))) {
+        std.log.info("{s} {s}", .{ @tagName(method), path });
+    }
     const request_id = headers.get("x-request-id") orelse try ids.requestId(app.io, arena);
     const session_hint = headers.get("x-cursor-session-id");
     const user_agent = headers.get("user-agent");

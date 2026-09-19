@@ -369,6 +369,18 @@ pub fn continuationRequiredIds(published: []const []const u8, unresolved: []cons
     return if (published.len > 0) published else unresolved;
 }
 
+/// When to leave waitBoundary.
+/// - tools in flight: settle ~160ms, or ~40ms after the bridge stream has ended
+/// - no tools, stream ended: wait ~160ms for a late CallCustomTool, then end_turn
+/// - no tools, still streaming: keep waiting
+pub fn waitBoundaryDone(n: usize, finished: bool, stable_ticks: u32, late_ticks: u32) bool {
+    if (n > 0) {
+        if (finished) return stable_ticks >= 2;
+        return stable_ticks >= 8;
+    }
+    return finished and late_ticks >= 8;
+}
+
 const UserContentScan = struct {
     results: []ToolResult,
     has_text: bool,
@@ -698,6 +710,16 @@ test "interleaved parallel function_call_outputs keep all ids in all_outputs" {
     try std.testing.expectEqual(@as(usize, 4), live.len);
     try std.testing.expectEqualStrings("a", live[0].output);
     try std.testing.expectEqualStrings("d", live[3].output);
+}
+
+test "waitBoundaryDone flushes tools after reasoning and waits for a late CallCustomTool" {
+    try std.testing.expect(!waitBoundaryDone(0, false, 0, 0));
+    try std.testing.expect(!waitBoundaryDone(0, true, 0, 7));
+    try std.testing.expect(waitBoundaryDone(0, true, 0, 8));
+    try std.testing.expect(!waitBoundaryDone(1, false, 7, 0));
+    try std.testing.expect(waitBoundaryDone(1, false, 8, 0));
+    try std.testing.expect(!waitBoundaryDone(2, true, 1, 0));
+    try std.testing.expect(waitBoundaryDone(2, true, 2, 0));
 }
 
 test "continuationRequiredIds uses published batch over later hub waiters" {

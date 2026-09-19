@@ -45,7 +45,7 @@ pub const Hub = struct {
         try self.by_id.put(w.call_id, w);
         self.cond.broadcast(self.io);
         self.mu.unlock(self.io);
-        std.log.info("toolcb hold {s} id={s}", .{ w.name, w.call_id });
+        std.log.info("toolcb hold {s} id={s} agent={s}", .{ w.name, w.call_id, w.agent_id });
         return w;
     }
 
