@@ -6,7 +6,7 @@
           {
             "type": "command",
             "command": "hooks/ensure-gateway.sh",
-            "timeout": 180
+            "timeout": 30
           }
         ]
       }
@@ -17,7 +17,7 @@
           {
             "type": "command",
             "command": "hooks/ensure-gateway.sh",
-            "timeout": 180
+            "timeout": 30
           }
         ]
       }

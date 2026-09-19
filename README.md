@@ -29,12 +29,12 @@ See [docs/design.md](docs/design.md).
 
 ## Run
 
-Daily driver on `127.0.0.1:8080` (Grok CIDR models). The Grok plugin `grok-plugin/` starts a **ReleaseFast** binary when a session starts:
+Daily driver on `127.0.0.1:8080` (Grok CIDR models). The Grok plugin ships a **prebuilt ReleaseFast** binary in `grok-plugin/bin/` and starts it when a session starts. It does not compile.
 
 ```bash
 zig build test
-zig build --release=fast
-~/.cursor-sdk2api-zig/start.sh   # builds --release=fast if the binary is missing/stale
+zig build --release=fast && ./scripts/install-plugin-bin.sh   # refresh the plugin binary (manual)
+~/.cursor-sdk2api-zig/start.sh   # runs grok-plugin/bin/cursor-sdk2api-zig only
 # GET http://127.0.0.1:8080/health  → service=cursor-sdk2api-zig, cursor.inference=sdk-bridge
 ```
 
