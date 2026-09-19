@@ -74,8 +74,6 @@ pub fn parseResponses(allocator: std.mem.Allocator, body: std.json.Value) Outcom
         appendNamed(&flatten, allocator, "user", text) catch return oom();
     } else if (jsonx.asArray(input)) |items| {
         if (items.len == 0) return fail("input must be a non-empty string or item array");
-        var saw_tool_output = false;
-        var saw_later_user = false;
         for (items) |item| {
             const typ = itemType(item) orelse return fail("input item must include type");
             if (isUnsupportedMedia(typ)) return failAlloc(allocator, "{s} is not supported", .{typ});
@@ -98,7 +96,6 @@ pub fn parseResponses(allocator: std.mem.Allocator, body: std.json.Value) Outcom
                 const output = toolOutputText(allocator, jsonx.get(item, "output")) catch return fail("function_call_output.output must be a string or content array");
                 continuation.append(allocator, .{ .call_id = call_id, .output = output }) catch return oom();
                 appendNamed(&flatten, allocator, "tool_result", output) catch return oom();
-                saw_tool_output = true;
                 continue;
             }
             if (std.mem.eql(u8, typ, "function_call") or std.mem.eql(u8, typ, "custom_tool_call")) {
@@ -131,7 +128,8 @@ pub fn parseResponses(allocator: std.mem.Allocator, body: std.json.Value) Outcom
                 continue;
             }
             if (std.mem.eql(u8, typ, "input_text") or role == null or std.mem.eql(u8, role.?, "user")) {
-                if (saw_tool_output) saw_later_user = true;
+                // Later user/message after historical function_call_output is a completed
+                // follow-up (Node flushResults), not a mixed latest turn.
                 continuation.clearRetainingCapacity();
                 last_user.clearRetainingCapacity();
                 appendLine(&last_user, allocator, text) catch return oom();
@@ -144,9 +142,6 @@ pub fn parseResponses(allocator: std.mem.Allocator, body: std.json.Value) Outcom
                 continue;
             }
             return failAlloc(allocator, "unsupported input item type: {s}", .{typ});
-        }
-        if (saw_tool_output and saw_later_user) {
-            return fail("function_call_output mixed with a later user/message item");
         }
     } else {
         return fail("input must be a non-empty string or item array");
@@ -591,6 +586,29 @@ test "responses continuation keeps parallel trailing function_call_outputs" {
     try std.testing.expectEqual(@as(usize, 2), out.ok.continuation.len);
     try std.testing.expectEqualStrings("c1", out.ok.continuation[0].call_id);
     try std.testing.expectEqualStrings("c2", out.ok.continuation[1].call_id);
+}
+
+test "responses follow-up after historical function_call_output is not mixed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(),
+        \\{"model":"grok-4.6","input":[{"type":"input_text","text":"hi"},{"type":"function_call","call_id":"call_old","name":"write","arguments":"{}"},{"type":"function_call_output","call_id":"call_old","output":"wrote"},{"type":"message","role":"assistant","content":"done"},{"type":"message","role":"user","content":"run it"}]}
+    , .{});
+    const out = parseResponses(arena.allocator(), parsed.value);
+    try std.testing.expectEqual(@as(usize, 0), out.ok.continuation.len);
+    try std.testing.expectEqualStrings("run it", out.ok.last_user_text);
+}
+
+test "responses continuation after a later user keeps only the trailing batch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(),
+        \\{"model":"grok-4.6","input":[{"type":"message","role":"user","content":"old request"},{"type":"function_call","call_id":"call_old","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call_old","output":"old result"},{"type":"message","role":"assistant","content":"old answer"},{"type":"message","role":"user","content":"latest request"},{"type":"function_call","call_id":"call_latest","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call_latest","output":"latest result"}]}
+    , .{});
+    const out = parseResponses(arena.allocator(), parsed.value);
+    try std.testing.expectEqual(@as(usize, 1), out.ok.continuation.len);
+    try std.testing.expectEqualStrings("call_latest", out.ok.continuation[0].call_id);
+    try std.testing.expectEqualStrings("latest request", out.ok.last_user_text);
 }
 
 test "messages continuation keeps only trailing tool results after the last assistant" {
