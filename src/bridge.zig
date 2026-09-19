@@ -152,6 +152,27 @@ pub const Bridge = struct {
         return self.waitBoundary(arena, live, parsed, message_id, session_id, now);
     }
 
+    pub fn forgetSession(self: *Bridge, session_id: []const u8) void {
+        self.mu.lockUncancelable(self.io);
+        const agent = self.agents.get(session_id);
+        _ = self.agents.remove(session_id);
+        _ = self.lives.remove(session_id);
+        if (agent) |aid| {
+            var drop = std.ArrayList([]const u8).empty;
+            var it = self.lineage.iterator();
+            while (it.next()) |e| {
+                if (std.mem.eql(u8, e.value_ptr.*, aid)) drop.append(self.gpa, e.key_ptr.*) catch {};
+            }
+            for (drop.items) |k| _ = self.lineage.remove(k);
+            if (drop.items.len > 0) self.gpa.free(drop.items);
+            self.mu.unlock(self.io);
+            self.hub.cancelAgent(aid);
+            std.log.info("forget session={s} agent={s}", .{ session_id, aid });
+            return;
+        }
+        self.mu.unlock(self.io);
+    }
+
     fn getLive(self: *Bridge, session_id: []const u8) ?*Live {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
@@ -737,6 +758,10 @@ fn restoreTool(catalog: []const protocol.Tool, sdk_name: []const u8) struct {
     return .{ .name = sdk_name, .namespace = "", .kind = .function };
 }
 
+// Connect JSON for sdk.v1.SdkImage: the `data` field is a oneof, so the wire
+// shape is nested {"data":{"data":...,"mimeType":...}}, not the flat TS SDK
+// API shape {"data":...,"mimeType":...}. Flat JSON fails with
+// "cannot decode message sdk.v1.SdkImageData from JSON".
 fn imagesJson(arena: std.mem.Allocator, images: []const protocol.Image) ![]const u8 {
     if (images.len == 0) return "";
     var out = std.ArrayList(u8).empty;
@@ -744,7 +769,7 @@ fn imagesJson(arena: std.mem.Allocator, images: []const protocol.Image) ![]const
     for (images, 0..) |img, i| {
         if (i > 0) try out.append(arena, ',');
         try out.appendSlice(arena, try std.fmt.allocPrint(arena,
-            "{{\"data\":{f},\"mimeType\":{f}}}",
+            "{{\"data\":{{\"data\":{f},\"mimeType\":{f}}}}}",
             .{ std.json.fmt(img.data, .{}), std.json.fmt(img.mime_type, .{}) },
         ));
     }

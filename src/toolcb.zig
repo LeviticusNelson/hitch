@@ -85,6 +85,23 @@ pub const Hub = struct {
         return true;
     }
 
+    pub fn cancelAgent(self: *Hub, agent_id: []const u8) void {
+        self.mu.lockUncancelable(self.io);
+        var call_ids = std.ArrayList([]const u8).empty;
+        var it = self.by_id.valueIterator();
+        while (it.next()) |ptr| {
+            const w = ptr.*;
+            if (w.done) continue;
+            if (agent_id.len > 0 and w.agent_id.len > 0 and !std.mem.eql(u8, w.agent_id, agent_id)) continue;
+            call_ids.append(self.gpa, w.call_id) catch continue;
+        }
+        self.mu.unlock(self.io);
+        for (call_ids.items) |id| {
+            _ = self.fulfill(id, "{\"error\":\"cancelled\"}");
+        }
+        if (call_ids.items.len > 0) self.gpa.free(call_ids.items);
+    }
+
     pub fn forget(self: *Hub, w: *Waiter) void {
         self.mu.lockUncancelable(self.io);
         _ = self.by_id.remove(w.call_id);

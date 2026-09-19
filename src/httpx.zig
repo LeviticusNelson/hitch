@@ -47,6 +47,10 @@ pub fn handle(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply) void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     serve(app, req, reply, arena) catch |err| {
+        if (err == error.WriteFailed) {
+            std.log.info("client closed mid-stream", .{});
+            return;
+        }
         std.log.err("request failed: {t}", .{err});
         if (!reply.started) {
             const body = encode.publicErrorJson(arena, errors.upstreamError("internal error"), "req_unknown") catch return;
@@ -268,6 +272,10 @@ fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
         .on_text = sseOnText,
         .on_thinking = sseOnThinking,
     }, reply, request_id, path)) orelse return;
+    if (reply.dead) {
+        br.forgetSession(sid);
+        return;
+    }
     if (turn.tools.len > 0) try writeFunctionCallSse(reply, arena, turn, &seq, box.next_output);
     switch (p.kind) {
         .responses => {
@@ -301,7 +309,10 @@ const SseBox = struct {
 
 fn boxEmit(box: *SseBox, event: []const u8, data_json: []const u8) void {
     const ev = encode.sseEvent(box.arena, event, data_json, box.seq.*) catch return;
-    writeSse(box.body, ev) catch return;
+    writeSse(box.body, ev) catch {
+        box.body.dead = true;
+        return;
+    };
     box.seq.* += 1;
 }
 
@@ -385,6 +396,7 @@ fn runBridge(
             error.BridgeRpcFailed => errors.upstreamError(msg),
             else => return err,
         };
+        if (err == error.BridgeRpcFailed) br.forgetSession(session_id);
         if (reply.started) {
             const json = try encode.publicErrorJson(arena, gw, request_id);
             try writeSse(reply, try encode.sseEvent(arena, "error", json, 0));

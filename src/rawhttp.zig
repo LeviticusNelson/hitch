@@ -150,6 +150,7 @@ pub const Reply = struct {
     writer: *std.Io.Writer,
     started: bool = false,
     sse: bool = false,
+    dead: bool = false,
 
     pub fn statusLine(code: u16) []const u8 {
         return switch (code) {
@@ -212,8 +213,14 @@ pub const Reply = struct {
     }
 
     pub fn writeAll(self: *Reply, bytes: []const u8) !void {
-        try self.writer.writeAll(bytes);
-        try self.writer.flush();
+        self.writer.writeAll(bytes) catch |err| {
+            self.dead = true;
+            return err;
+        };
+        self.writer.flush() catch |err| {
+            self.dead = true;
+            return err;
+        };
     }
 
     pub fn end(self: *Reply) !void {
