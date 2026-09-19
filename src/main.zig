@@ -44,6 +44,7 @@ pub fn main(init: std.process.Init) !void {
         .use_fake = cfg.fake_cursor or cfg.cursor_api_key == null,
         .bridge = null,
         .catalog = null,
+        .replay = std.StringHashMap([]u8).init(gpa),
     };
 
     if (cfg.cursor_api_key) |key| {

@@ -57,11 +57,25 @@ pub fn healthJson(
     accepting: bool,
     catalog: []const u8,
     inference: []const u8,
+    shutting_down: bool,
+    active_runs: u32,
+    managed_failover: bool,
 ) ![]u8 {
-    const status = if (accepting) "ok" else "not_ready";
+    const status = if (accepting and !shutting_down) "ok" else "not_ready";
     return std.fmt.allocPrint(allocator,
-        "{{\"status\":\"{s}\",\"service\":\"cursor-sdk2api-zig\",\"version\":\"{s}\",\"sdk_version\":\"{s}\",\"runtime\":\"zig\",\"instance_id\":\"{s}\",\"cursor\":{{\"catalog\":\"{s}\",\"inference\":\"{s}\",\"cloud_agents\":false}},\"readiness\":{{\"accepting_sessions\":{s},\"shutting_down\":false}},\"capabilities\":{{\"messages\":true,\"count_tokens\":true,\"chat_completions\":true,\"responses\":true,\"streaming\":true,\"thinking\":true,\"images\":true,\"tools\":true,\"parallel_tools\":true,\"replay\":true,\"agent_resume\":true,\"pending_tool_restart_resume\":true,\"ordinary_turn_coordinator\":true,\"streaming_impl\":\"sdk_onDelta\",\"store_backend\":\"jsonl\"}}}}",
-        .{ status, version, sdk_version, instance_id, catalog, inference, if (accepting) "true" else "false" },
+        "{{\"status\":\"{s}\",\"service\":\"cursor-sdk2api-zig\",\"version\":\"{s}\",\"sdk_version\":\"{s}\",\"runtime\":\"zig\",\"instance_id\":\"{s}\",\"cursor\":{{\"catalog\":\"{s}\",\"inference\":\"{s}\",\"cloud_agents\":false}},\"readiness\":{{\"accepting_sessions\":{s},\"shutting_down\":{s}}},\"capacity\":{{\"global_active_runs\":{d}}},\"capabilities\":{{\"messages\":true,\"count_tokens\":true,\"chat_completions\":true,\"responses\":true,\"streaming\":true,\"thinking\":true,\"images\":true,\"tools\":true,\"parallel_tools\":true,\"replay\":true,\"agent_resume\":true,\"pending_tool_restart_resume\":true,\"ordinary_turn_coordinator\":true,\"streaming_impl\":\"sdk_onDelta\",\"store_backend\":\"jsonl\",\"transcript_tool_recovery\":true,\"stale_auth_recovery\":true,\"managed_account_failover\":{s}}}}}",
+        .{
+            status,
+            version,
+            sdk_version,
+            instance_id,
+            catalog,
+            inference,
+            if (accepting and !shutting_down) "true" else "false",
+            if (shutting_down) "true" else "false",
+            active_runs,
+            if (managed_failover) "true" else "false",
+        },
     );
 }
 

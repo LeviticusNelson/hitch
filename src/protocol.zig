@@ -21,6 +21,13 @@ pub const ToolResult = struct {
     output: []const u8,
 };
 
+pub const Image = struct {
+    mime_type: []const u8 = "image/png",
+    data: []const u8,
+};
+
+pub const ToolChoiceKind = enum { auto, required, named };
+
 pub const Parsed = struct {
     kind: Kind,
     model: []const u8,
@@ -38,6 +45,11 @@ pub const Parsed = struct {
     compaction_token: ?[]const u8,
     include_usage: bool,
     effort: ?[]const u8,
+    images: []Image = &.{},
+    tool_choice: ToolChoiceKind = .auto,
+    tool_choice_name: []const u8 = "",
+    parallel_tools: bool = true,
+    cursor_params_json: []const u8 = "",
     raw: std.json.Value,
 };
 
@@ -67,6 +79,7 @@ pub fn parseResponses(allocator: std.mem.Allocator, body: std.json.Value) Outcom
     var all_outputs = std.ArrayList(ToolResult).empty;
     var trigger = false;
     var token: ?[]const u8 = null;
+    var images = std.ArrayList(Image).empty;
 
     if (jsonx.getStr(body, "instructions")) |s| appendLine(&system, allocator, s) catch return oom();
     if (jsonx.getStr(body, "system")) |s| appendLine(&system, allocator, s) catch return oom();
@@ -81,6 +94,18 @@ pub fn parseResponses(allocator: std.mem.Allocator, body: std.json.Value) Outcom
         for (items) |item| {
             const typ = itemType(item) orelse return fail("input item must include type");
             if (isUnsupportedMedia(typ)) return failAlloc(allocator, "{s} is not supported", .{typ});
+            if (std.mem.eql(u8, typ, "input_image") or std.mem.eql(u8, typ, "image_url") or std.mem.eql(u8, typ, "image")) {
+                continuation.clearRetainingCapacity();
+                switch (parseImagePart(allocator, item)) {
+                    .skip => {},
+                    .ok => |img| {
+                        images.append(allocator, img) catch return oom();
+                        appendNamed(&flatten, allocator, "user", "[image]") catch return oom();
+                    },
+                    .err => |e| return .{ .err = e },
+                }
+                continue;
+            }
             if (std.mem.eql(u8, typ, "compaction_trigger")) {
                 // Node flushResults(): only the trailing function_call_output batch is live continuation.
                 continuation.clearRetainingCapacity();
@@ -133,7 +158,10 @@ pub fn parseResponses(allocator: std.mem.Allocator, body: std.json.Value) Outcom
             }
             if (std.mem.eql(u8, typ, "input_text") or role == null or std.mem.eql(u8, role.?, "user")) {
                 const content_val = jsonx.get(item, "content") orelse jsonx.get(item, "text") orelse item;
-                const nested = scanUserContent(allocator, content_val, &all_outputs) catch return oom();
+                const nested = switch (scanUserContent(allocator, content_val, &all_outputs, &images)) {
+                    .ok => |s| s,
+                    .err => |e| return .{ .err = e },
+                };
                 if (nested.results.len > 0 and nested.has_text) {
                     return fail("mixed new text and tool_result in the latest user turn is not allowed");
                 }
@@ -179,6 +207,11 @@ pub fn parseResponses(allocator: std.mem.Allocator, body: std.json.Value) Outcom
         return fail("input must include a user message or function_call_output");
     }
 
+    const choice = switch (toolChoiceOf(body)) {
+        .ok => |c| c,
+        .err => |e| return .{ .err = e },
+    };
+
     const system_text = system.toOwnedSlice(allocator) catch return oom();
     if (system_text.len > 0) {
         var prefixed = std.ArrayList(u8).empty;
@@ -203,6 +236,11 @@ pub fn parseResponses(allocator: std.mem.Allocator, body: std.json.Value) Outcom
         .compaction_token = token,
         .include_usage = true,
         .effort = effortOf(body),
+        .images = images.toOwnedSlice(allocator) catch return oom(),
+        .tool_choice = choice.kind,
+        .tool_choice_name = choice.name,
+        .parallel_tools = choice.parallel,
+        .cursor_params_json = cursorParamsOf(body),
         .raw = body,
     } };
 }
@@ -258,6 +296,7 @@ fn parseTranscript(
     var continuation = std.ArrayList(ToolResult).empty;
     var tools_list = std.ArrayList(Tool).empty;
     var all_outputs = std.ArrayList(ToolResult).empty;
+    var images = std.ArrayList(Image).empty;
 
     if (system_field) |sys| {
         const text = jsonx.collectText(sys, allocator) catch return oom();
@@ -282,14 +321,28 @@ fn parseTranscript(
             appendNamed(&flatten, allocator, "tool_result", output) catch return oom();
             continue;
         }
-        const text = jsonx.collectText(jsonx.get(msg, "content") orelse .null, allocator) catch return oom();
+        const content_val = jsonx.get(msg, "content") orelse .null;
         if (std.mem.eql(u8, role, "user")) {
+            if (jsonx.asArray(content_val)) |parts| {
+                for (parts) |part| {
+                    switch (parseImagePart(allocator, part)) {
+                        .skip => {},
+                        .ok => |img| {
+                            images.append(allocator, img) catch return oom();
+                            appendNamed(&flatten, allocator, "user", "[image]") catch return oom();
+                        },
+                        .err => |e| return .{ .err = e },
+                    }
+                }
+            }
+            const text = jsonx.collectText(content_val, allocator) catch return oom();
             last_user.clearRetainingCapacity();
             appendLine(&last_user, allocator, text) catch return oom();
             continuation.clearRetainingCapacity();
             appendNamed(&flatten, allocator, "user", text) catch return oom();
             continue;
         }
+        const text = jsonx.collectText(content_val, allocator) catch return oom();
         if (std.mem.eql(u8, role, "assistant")) {
             continuation.clearRetainingCapacity();
             appendNamed(&flatten, allocator, "assistant", text) catch return oom();
@@ -309,6 +362,11 @@ fn parseTranscript(
             parseChatOrMessageTool(allocator, t, &tools_list) catch return fail("tool name must match [a-zA-Z0-9_-]{1,128}");
         }
     }
+
+    const choice = switch (toolChoiceOf(body)) {
+        .ok => |c| c,
+        .err => |e| return .{ .err = e },
+    };
 
     const system_text = system.toOwnedSlice(allocator) catch return oom();
     if (system_text.len > 0) {
@@ -334,6 +392,11 @@ fn parseTranscript(
         .compaction_token = null,
         .include_usage = kind != .chat,
         .effort = effortOf(body),
+        .images = images.toOwnedSlice(allocator) catch return oom(),
+        .tool_choice = choice.kind,
+        .tool_choice_name = choice.name,
+        .parallel_tools = choice.parallel,
+        .cursor_params_json = cursorParamsOf(body),
         .raw = body,
     } };
 }
@@ -386,24 +449,148 @@ const UserContentScan = struct {
     has_text: bool,
 };
 
+const ImageOutcome = union(enum) {
+    skip,
+    ok: Image,
+    err: errors.Error,
+};
+
+const Choice = struct {
+    kind: ToolChoiceKind = .auto,
+    name: []const u8 = "",
+    parallel: bool = true,
+};
+
 fn scanUserContent(
     allocator: std.mem.Allocator,
     content: std.json.Value,
     all_outputs: *std.ArrayList(ToolResult),
-) !UserContentScan {
-    const parts = jsonx.asArray(content) orelse return .{ .results = &.{}, .has_text = false };
+    images: *std.ArrayList(Image),
+) union(enum) { ok: UserContentScan, err: errors.Error } {
+    const parts = jsonx.asArray(content) orelse return .{ .ok = .{ .results = &.{}, .has_text = false } };
     var results = std.ArrayList(ToolResult).empty;
     var has_text = false;
     for (parts) |part| {
         if (takeOutput(allocator, part)) |o| {
-            try all_outputs.append(allocator, o);
-            try results.append(allocator, o);
+            all_outputs.append(allocator, o) catch return .{ .err = errors.upstreamError("out of memory") };
+            results.append(allocator, o) catch return .{ .err = errors.upstreamError("out of memory") };
             continue;
         }
-        const t = try jsonx.collectText(part, allocator);
+        switch (parseImagePart(allocator, part)) {
+            .skip => {},
+            .ok => |img| {
+                images.append(allocator, img) catch return .{ .err = errors.upstreamError("out of memory") };
+                continue;
+            },
+            .err => |e| return .{ .err = e },
+        }
+        const t = jsonx.collectText(part, allocator) catch return .{ .err = errors.upstreamError("out of memory") };
         if (std.mem.trim(u8, t, " \t\r\n").len > 0) has_text = true;
     }
-    return .{ .results = results.toOwnedSlice(allocator) catch return error.OutOfMemory, .has_text = has_text };
+    return .{ .ok = .{
+        .results = results.toOwnedSlice(allocator) catch return .{ .err = errors.upstreamError("out of memory") },
+        .has_text = has_text,
+    } };
+}
+
+fn parseImagePart(allocator: std.mem.Allocator, part: std.json.Value) ImageOutcome {
+    _ = allocator;
+    const typ = jsonx.getStr(part, "type") orelse return .skip;
+    if (!std.mem.eql(u8, typ, "input_image") and !std.mem.eql(u8, typ, "image_url") and !std.mem.eql(u8, typ, "image")) {
+        return .skip;
+    }
+    if (jsonx.get(part, "file_id")) |v| {
+        if (v != .null) return .{ .err = errors.invalidRequest("input_image.file_id is not supported; use a base64 data URL") };
+    }
+    if (jsonx.get(part, "source")) |src| {
+        if (jsonx.getStr(src, "data")) |data| {
+            const mime = jsonx.getStr(src, "media_type") orelse "image/png";
+            if (data.len == 0) return .{ .err = errors.invalidRequest("input_image.image_url must be a base64 data URL; remote URLs are not fetched") };
+            return .{ .ok = .{ .mime_type = mime, .data = data } };
+        }
+    }
+    const url = readImageUrl(part) orelse {
+        return .{ .err = errors.invalidRequest("input_image requires image_url") };
+    };
+    if (std.ascii.startsWithIgnoreCase(url, "http://") or std.ascii.startsWithIgnoreCase(url, "https://") or std.mem.startsWith(u8, url, "//")) {
+        return .{ .err = errors.invalidRequest("input_image.image_url must be a base64 data URL; remote URLs are not fetched") };
+    }
+    const parsed = parseDataUrl(url) orelse {
+        return .{ .err = errors.invalidRequest("input_image.image_url must be a base64 data URL; remote URLs are not fetched") };
+    };
+    return .{ .ok = .{ .mime_type = parsed.mime, .data = parsed.data } };
+}
+
+fn readImageUrl(part: std.json.Value) ?[]const u8 {
+    if (jsonx.getStr(part, "image_url")) |s| return s;
+    if (jsonx.get(part, "image_url")) |v| {
+        if (jsonx.getStr(v, "url")) |s| return s;
+    }
+    if (jsonx.getStr(part, "image")) |s| return s;
+    if (jsonx.getStr(part, "url")) |s| return s;
+    return null;
+}
+
+fn parseDataUrl(url: []const u8) ?struct { mime: []const u8, data: []const u8 } {
+    const trimmed = std.mem.trim(u8, url, " \t\r\n");
+    if (!std.ascii.startsWithIgnoreCase(trimmed, "data:")) return null;
+    const rest = trimmed["data:".len..];
+    const comma = std.mem.indexOfScalar(u8, rest, ',') orelse return null;
+    const meta = rest[0..comma];
+    const data = rest[comma + 1 ..];
+    if (std.mem.indexOf(u8, meta, "base64") == null) return null;
+    var mime: []const u8 = "image/png";
+    if (std.mem.indexOfScalar(u8, meta, ';')) |semi| {
+        const m = std.mem.trim(u8, meta[0..semi], " \t");
+        if (m.len > 0) mime = m;
+    } else {
+        const m = std.mem.trim(u8, meta, " \t");
+        if (m.len > 0 and !std.ascii.eqlIgnoreCase(m, "base64")) mime = m;
+    }
+    if (data.len == 0) return null;
+    return .{ .mime = mime, .data = data };
+}
+
+fn toolChoiceOf(body: std.json.Value) union(enum) { ok: Choice, err: errors.Error } {
+    var choice: Choice = .{};
+    if (jsonx.getBool(body, "parallel_tool_calls")) |p| choice.parallel = p;
+    if (jsonx.isTrue(body, "disable_parallel_tool_use")) choice.parallel = false;
+    const tc = jsonx.get(body, "tool_choice") orelse return .{ .ok = choice };
+    if (jsonx.asStr(tc)) |s| {
+        if (std.mem.eql(u8, s, "auto")) return .{ .ok = choice };
+        if (std.mem.eql(u8, s, "required") or std.mem.eql(u8, s, "any")) {
+            choice.kind = .required;
+            return .{ .ok = choice };
+        }
+        if (std.mem.eql(u8, s, "none")) {
+            return .{ .err = errors.invalidRequest("tool_choice none is not supported") };
+        }
+    }
+    if (jsonx.getStr(tc, "type")) |typ| {
+        if (std.mem.eql(u8, typ, "none")) {
+            return .{ .err = errors.invalidRequest("tool_choice none is not supported") };
+        }
+        if (std.mem.eql(u8, typ, "function") or std.mem.eql(u8, typ, "tool")) {
+            const name = jsonx.getStr(jsonx.get(tc, "function") orelse tc, "name") orelse jsonx.getStr(tc, "name") orelse {
+                return .{ .err = errors.invalidRequest("tool_choice function requires name") };
+            };
+            choice.kind = .named;
+            choice.name = name;
+            return .{ .ok = choice };
+        }
+        if (std.mem.eql(u8, typ, "any") or std.mem.eql(u8, typ, "required")) {
+            choice.kind = .required;
+            return .{ .ok = choice };
+        }
+    }
+    return .{ .ok = choice };
+}
+
+fn cursorParamsOf(body: std.json.Value) []const u8 {
+    if (jsonx.get(body, "cursor_model_params")) |_| {
+        return "present";
+    }
+    return "";
 }
 
 fn takeOutput(allocator: std.mem.Allocator, item: std.json.Value) ?ToolResult {
@@ -425,7 +612,8 @@ pub fn estimateInputTokens(parsed: Parsed) u32 {
     const chars = parsed.system_text.len + parsed.flatten_text.len;
     const text = @as(u32, @intCast((chars + 3) / 4));
     const overhead = @as(u32, @intCast(parsed.tools.len * 8 + 4));
-    return @max(@as(u32, 1), text + overhead);
+    const images = @as(u32, @intCast(parsed.images.len * 1_600));
+    return @max(@as(u32, 1), text + overhead + images);
 }
 
 fn parseAdditionalTool(allocator: std.mem.Allocator, tool: std.json.Value, tools: *std.ArrayList(Tool)) !void {
@@ -798,4 +986,37 @@ test "messages requires model and messages" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"messages\":[]}", .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("model is required", parseMessages(std.testing.allocator, parsed.value).err.message);
+}
+
+test "responses base64 input_image is accepted and remote URL is 422" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ok_raw = try std.json.parseFromSlice(std.json.Value, arena.allocator(),
+        \\{"model":"grok-4.6","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"what is this"},{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]}
+    , .{});
+    const ok = parseResponses(arena.allocator(), ok_raw.value);
+    try std.testing.expectEqual(@as(usize, 1), ok.ok.images.len);
+    try std.testing.expectEqualStrings("image/png", ok.ok.images[0].mime_type);
+    try std.testing.expectEqualStrings("AAAA", ok.ok.images[0].data);
+
+    const bad_raw = try std.json.parseFromSlice(std.json.Value, arena.allocator(),
+        \\{"model":"grok-4.6","input":[{"type":"input_image","image_url":"https://example.com/x.png"}]}
+    , .{});
+    const bad = parseResponses(arena.allocator(), bad_raw.value);
+    try std.testing.expectEqual(@as(u16, 422), bad.err.http_status);
+    try std.testing.expect(std.mem.indexOf(u8, bad.err.message, "base64 data URL") != null);
+}
+
+test "chat image_url remote is 422 and tool_choice none is rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const img = try std.json.parseFromSlice(std.json.Value, arena.allocator(),
+        \\{"model":"grok-4.6","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://x"}}]}]}
+    , .{});
+    try std.testing.expectEqual(@as(u16, 422), parseChat(arena.allocator(), img.value).err.http_status);
+
+    const none = try std.json.parseFromSlice(std.json.Value, arena.allocator(),
+        \\{"model":"grok-4.6","messages":[{"role":"user","content":"hi"}],"tool_choice":"none"}
+    , .{});
+    try std.testing.expectEqual(@as(u16, 422), parseChat(arena.allocator(), none.value).err.http_status);
 }

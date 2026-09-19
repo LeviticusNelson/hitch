@@ -97,7 +97,11 @@ fn needsUnprocessable(message: []const u8) bool {
     return containsIgnoreCase(message, "mixed") or
         containsIgnoreCase(message, "tool_result") or
         containsIgnoreCase(message, "schema") or
-        containsIgnoreCase(message, "must");
+        containsIgnoreCase(message, "must") or
+        containsIgnoreCase(message, "image_url") or
+        containsIgnoreCase(message, "data url") or
+        containsIgnoreCase(message, "tool_choice") or
+        containsIgnoreCase(message, "unknown tool");
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {

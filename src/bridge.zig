@@ -22,6 +22,7 @@ pub const Bridge = struct {
     workspace: []const u8,
     child: ?std.process.Child = null,
     agents: std.StringHashMap([]const u8) = undefined,
+    efforts: std.StringHashMap([]const u8) = undefined,
     lives: std.StringHashMap(*Live) = undefined,
     hub: *toolcb.Hub,
     group: *Io.Group,
@@ -98,11 +99,16 @@ pub const Bridge = struct {
             return self.waitBoundary(arena, live, parsed, message_id, session_id, now);
         }
 
+        self.mu.lockUncancelable(self.io);
+        const known = self.agents.get(session_id) != null;
+        self.mu.unlock(self.io);
         const agent_id = try self.ensureAgent(arena, parsed, session_id);
-        const prompt = clip(parsed.flatten_text, models.sdkPromptMaxCharsForModel(parsed.upstream_model));
+        const raw_prompt = if (known and parsed.last_user_text.len > 0) parsed.last_user_text else parsed.flatten_text;
+        const prompt = clip(raw_prompt, models.sdkPromptMaxCharsForModel(parsed.upstream_model));
+        const images_json = try imagesJson(arena, parsed.images);
         const send_json_tmp = try std.fmt.allocPrint(arena,
-            "{{\"agentId\":{f},\"message\":{{\"text\":{f}}},\"options\":{{\"enableDeltas\":true}}}}",
-            .{ std.json.fmt(agent_id, .{}), std.json.fmt(prompt, .{}) },
+            "{{\"agentId\":{f},\"message\":{{\"text\":{f}{s}}},\"options\":{{\"enableDeltas\":true}}}}",
+            .{ std.json.fmt(agent_id, .{}), std.json.fmt(prompt, .{}), images_json },
         );
         const live = try self.gpa.create(Live);
         live.* = .{
@@ -291,6 +297,25 @@ pub const Bridge = struct {
 
     fn ensureAgent(self: *Bridge, arena: std.mem.Allocator, parsed: protocol.Parsed, session_id: []const u8) ![]const u8 {
         self.mu.lockUncancelable(self.io);
+        if (self.efforts.get(session_id)) |bound| {
+            if (parsed.effort) |want| {
+                if (!std.mem.eql(u8, bound, want)) {
+                    self.mu.unlock(self.io);
+                    self.last_err = "cursor_model_params cannot change on an existing session";
+                    return error.SessionConflict;
+                }
+            }
+        } else if (parsed.effort) |want| {
+            const key = self.gpa.dupe(u8, session_id) catch {
+                self.mu.unlock(self.io);
+                return error.OutOfMemory;
+            };
+            const val = self.gpa.dupe(u8, want) catch {
+                self.mu.unlock(self.io);
+                return error.OutOfMemory;
+            };
+            self.efforts.put(key, val) catch {};
+        }
         if (self.agents.get(session_id)) |id| {
             self.mu.unlock(self.io);
             return id;
@@ -586,6 +611,21 @@ fn restoreTool(catalog: []const protocol.Tool, sdk_name: []const u8) struct {
     return .{ .name = sdk_name, .namespace = "", .kind = .function };
 }
 
+fn imagesJson(arena: std.mem.Allocator, images: []const protocol.Image) ![]const u8 {
+    if (images.len == 0) return "";
+    var out = std.ArrayList(u8).empty;
+    try out.appendSlice(arena, ",\"images\":[");
+    for (images, 0..) |img, i| {
+        if (i > 0) try out.append(arena, ',');
+        try out.appendSlice(arena, try std.fmt.allocPrint(arena,
+            "{{\"data\":{f},\"mimeType\":{f}}}",
+            .{ std.json.fmt(img.data, .{}), std.json.fmt(img.mime_type, .{}) },
+        ));
+    }
+    try out.append(arena, ']');
+    return out.items;
+}
+
 fn clip(text: []const u8, max: u32) []const u8 {
     if (text.len <= max) return text;
     return text[text.len - max ..];
@@ -642,6 +682,7 @@ pub fn spawn(
         .workspace = workspace,
         .child = child,
         .agents = std.StringHashMap([]const u8).init(gpa),
+        .efforts = std.StringHashMap([]const u8).init(gpa),
         .lives = std.StringHashMap(*Live).init(gpa),
         .hub = hub,
         .group = group,

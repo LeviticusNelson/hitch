@@ -156,6 +156,87 @@ def main() -> int:
         f"stream={st} health_ok={health_hits['ok']} health_fail={health_hits['fail']} {health_hits['detail']}",
     )
 
+    status, raw, _ = req(
+        "POST",
+        "/v1/responses",
+        {
+            "model": "grok-4.6",
+            "stream": False,
+            "input": [{"type": "input_image", "image_url": "https://example.com/x.png"}],
+        },
+        timeout=15,
+    )
+    expect(
+        "remote input_image is 422",
+        status in (400, 422) and b"base64 data URL" in raw,
+        f"status={status} head={raw[:180]!r}",
+    )
+
+    png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    status, raw, _ = req(
+        "POST",
+        "/v1/responses",
+        {
+            "model": "grok-4.6",
+            "stream": False,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Reply with exactly the word PONG."},
+                        {"type": "input_image", "image_url": png},
+                    ],
+                }
+            ],
+        },
+        timeout=90,
+    )
+    expect(
+        "base64 input_image is not 422",
+        status != 422 and b"base64 data URL" not in raw,
+        f"status={status} head={raw[:180]!r}",
+    )
+
+    status, raw, _ = req(
+        "POST",
+        "/v1/chat/completions",
+        {
+            "model": "grok-4.6",
+            "stream": False,
+            "tool_choice": "none",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        timeout=15,
+    )
+    expect(
+        "tool_choice none is 422",
+        status in (400, 422) and b"tool_choice" in raw,
+        f"status={status} head={raw[:180]!r}",
+    )
+
+    model_ns: list[int] = []
+    model_err: list[str] = []
+
+    def poke_models():
+        st, body, _ = req("GET", "/v1/models", timeout=15)
+        o = j(body) or {}
+        n = len(o.get("data") or [])
+        model_ns.append(n)
+        if st != 200 or n < 10:
+            model_err.append(f"status={st} n={n}")
+
+    threads = [threading.Thread(target=poke_models) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+    expect(
+        "concurrent GET /v1/models stays full",
+        len(model_err) == 0 and model_ns and min(model_ns) >= 10,
+        f"ns={model_ns} err={model_err}",
+    )
+
     # Builtin hung here previously
     status, raw, _ = req(
         "POST",

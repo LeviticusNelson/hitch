@@ -8,6 +8,7 @@ const engine = @import("engine.zig");
 const errors = @import("errors.zig");
 const grok_summary = @import("grok_summary.zig");
 const ids = @import("ids.zig");
+const digest = @import("digest.zig");
 const jsonx = @import("jsonx.zig");
 const models = @import("models.zig");
 const protocol = @import("protocol.zig");
@@ -26,6 +27,10 @@ pub const App = struct {
     bridge: ?*BridgeClient = null,
     catalog: ?*cursor_api.Catalog = null,
     cursor_bridge: ?*bridge_mod.Bridge = null,
+    shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    active_runs: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    replay_mu: Io.Mutex = .init,
+    replay: std.StringHashMap([]u8) = undefined,
 };
 
 pub const BridgeClient = struct {
@@ -62,7 +67,19 @@ fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
     if (method == .GET and (std.mem.eql(u8, path, "/health") or std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/v1"))) {
         const catalog_mode: []const u8 = if (app.catalog != null) "native" else "fake";
         const inference_mode: []const u8 = if (app.use_fake) "fake" else if (app.cursor_bridge != null) "sdk-bridge" else "unavailable";
-        const body = try encode.healthJson(arena, config_mod.version, app.instance_id, app.sdk_version, true, catalog_mode, inference_mode);
+        const shutting = app.shutting_down.load(.seq_cst);
+        const body = try encode.healthJson(
+            arena,
+            config_mod.version,
+            app.instance_id,
+            app.sdk_version,
+            !shutting,
+            catalog_mode,
+            inference_mode,
+            shutting,
+            app.active_runs.load(.seq_cst),
+            app.config.auth_mode == .managed,
+        );
         return sendJson(reply, .ok, body, request_id, null);
     }
 
@@ -151,6 +168,15 @@ fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
         session_hint orelse "-",
     });
 
+    const req_hash = digest.sha256Hex(req.body);
+    if (!p.stream) {
+        if (lookupReplay(app, req_hash[0..])) |cached| {
+            return sendJson(reply, .ok, cached, request_id, session_hint);
+        }
+    }
+    _ = app.active_runs.fetchAdd(1, .seq_cst);
+    defer _ = app.active_runs.fetchSub(1, .seq_cst);
+
     if (isCompactPath(path) or p.compaction_trigger) {
         const compact_id = try ids.compactId(app.io, arena);
         const minted = app.compact.mint(arena, compact_id, p.model) catch {
@@ -175,7 +201,7 @@ fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
             .input_tokens = protocol.estimateInputTokens(p),
             .output_tokens = 16,
         };
-        return writeTurn(reply, arena, p, turn, request_id);
+        return writeTurn(app, reply, arena, p, turn, request_id, req_hash[0..]);
     }
 
     const sid = session_hint orelse try ids.sessionId(app.io, arena);
@@ -184,7 +210,7 @@ fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
 
     if (app.use_fake) {
         const turn = try engine.Fake.run(arena, p, sid, mid, now);
-        return writeTurn(reply, arena, p, turn, request_id);
+        return writeTurn(app, reply, arena, p, turn, request_id, req_hash[0..]);
     }
     const br = app.cursor_bridge orelse {
         return sendErr(
@@ -198,7 +224,7 @@ fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
 
     if (!p.stream) {
         const turn = (try runBridge(br, arena, p, sid, mid, now, .{}, reply, request_id, path)) orelse return;
-        return writeTurn(reply, arena, p, turn, request_id);
+        return writeTurn(app, reply, arena, p, turn, request_id, req_hash[0..]);
     }
 
     if (p.continuation.len > 0) {
@@ -349,6 +375,8 @@ fn runBridge(
         const gw = switch (err) {
             error.UnknownToolId, error.MissingToolResult => errors.invalidRequest(msg),
             error.SessionLost => errors.sessionLost(msg),
+            error.SessionConflict => errors.sessionConflict(msg),
+            error.BridgeRpcFailed => errors.upstreamError(msg),
             else => return err,
         };
         if (reply.started) {
@@ -414,13 +442,14 @@ fn writeFunctionCallSse(reply: *rawhttp.Reply, arena: std.mem.Allocator, turn: e
     }
 }
 
-fn writeTurn(reply: *rawhttp.Reply, arena: std.mem.Allocator, parsed: protocol.Parsed, turn: encode.Turn, request_id: []const u8) !void {
+fn writeTurn(app: *App, reply: *rawhttp.Reply, arena: std.mem.Allocator, parsed: protocol.Parsed, turn: encode.Turn, request_id: []const u8, req_hash: []const u8) !void {
     if (!parsed.stream) {
         const json = switch (parsed.kind) {
             .responses => try encode.encodeResponse(arena, turn),
             .messages => try encode.encodeMessage(arena, turn),
             .chat => try encode.encodeChat(arena, turn),
         };
+        storeReplay(app, req_hash, json);
         return sendJson(reply, .ok, json, request_id, turn.session_id);
     }
     try reply.beginSse(&.{
@@ -669,6 +698,20 @@ fn isCompactPath(path: []const u8) bool {
 
 fn unixNow(io: Io) i64 {
     return @intCast(@divTrunc(Io.Clock.real.now(io).nanoseconds, 1_000_000_000));
+}
+
+fn lookupReplay(app: *App, hex: []const u8) ?[]const u8 {
+    app.replay_mu.lockUncancelable(app.io);
+    defer app.replay_mu.unlock(app.io);
+    return app.replay.get(hex);
+}
+
+fn storeReplay(app: *App, hex: []const u8, json: []const u8) void {
+    const key = app.gpa.dupe(u8, hex) catch return;
+    const val = app.gpa.dupe(u8, json) catch return;
+    app.replay_mu.lockUncancelable(app.io);
+    defer app.replay_mu.unlock(app.io);
+    app.replay.put(key, val) catch {};
 }
 
 fn pathOnly(target: []const u8) []const u8 {
