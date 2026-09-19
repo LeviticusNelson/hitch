@@ -75,3 +75,5 @@ Cursor does **not** publish a chat-completions / raw inference API. Cloud Agents
 `FAKE_CURSOR=1` or a missing API key uses the local fake driver for HTTP contract tests.
 
 The Grok-facing process is Zig. Cursor’s **local agent executor** is still the official `cursor-sdk-bridge` binary (Bun-compiled `@cursor/sdk`). GitHub `cursor/sdk-bridge` publishes protos and adapter docs only — there is no server source to port, and we will not decompile the minified local executor. A 100% Zig Cursor executor is not possible with published APIs.
+
+`cursor-sdk-bridge` is `MH_EXECUTE` (not `MH_DYLIB`). `nm -gU` exports only `__mh_execute_header`. There is no C ABI to `@cImport`. The published ABI is Connect HTTP/1.1 JSON (`sdk.v1`). `src/sdk.zig` is that adapter as a Zig module (`zig build` installs `libcursor-sdk-bridge.a`).

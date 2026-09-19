@@ -31,6 +31,9 @@ pub const Parsed = struct {
     flatten_text: []const u8,
     tools: []Tool,
     continuation: []ToolResult,
+    /// Every function_call_output in the request, including historical ones.
+    /// Live continuation is pending ∩ all_outputs (see selectPendingResults).
+    all_outputs: []ToolResult,
     compaction_trigger: bool,
     compaction_token: ?[]const u8,
     include_usage: bool,
@@ -61,6 +64,7 @@ pub fn parseResponses(allocator: std.mem.Allocator, body: std.json.Value) Outcom
     var last_user = std.ArrayList(u8).empty;
     var tools_list = std.ArrayList(Tool).empty;
     var continuation = std.ArrayList(ToolResult).empty;
+    var all_outputs = std.ArrayList(ToolResult).empty;
     var trigger = false;
     var token: ?[]const u8 = null;
 
@@ -91,11 +95,11 @@ pub fn parseResponses(allocator: std.mem.Allocator, body: std.json.Value) Outcom
                 last_user.clearRetainingCapacity();
                 continue;
             }
-            if (std.mem.eql(u8, typ, "function_call_output") or std.mem.eql(u8, typ, "custom_tool_call_output")) {
-                const call_id = jsonx.getStr(item, "call_id") orelse return fail("tool call output must include call_id");
-                const output = toolOutputText(allocator, jsonx.get(item, "output")) catch return fail("function_call_output.output must be a string or content array");
-                continuation.append(allocator, .{ .call_id = call_id, .output = output }) catch return oom();
-                appendNamed(&flatten, allocator, "tool_result", output) catch return oom();
+            if (std.mem.eql(u8, typ, "function_call_output") or std.mem.eql(u8, typ, "custom_tool_call_output") or std.mem.eql(u8, typ, "tool_result")) {
+                const taken = takeOutput(allocator, item) orelse return fail("tool call output must include call_id");
+                continuation.append(allocator, taken) catch return oom();
+                all_outputs.append(allocator, taken) catch return oom();
+                appendNamed(&flatten, allocator, "tool_result", taken.output) catch return oom();
                 continue;
             }
             if (std.mem.eql(u8, typ, "function_call") or std.mem.eql(u8, typ, "custom_tool_call")) {
@@ -128,6 +132,20 @@ pub fn parseResponses(allocator: std.mem.Allocator, body: std.json.Value) Outcom
                 continue;
             }
             if (std.mem.eql(u8, typ, "input_text") or role == null or std.mem.eql(u8, role.?, "user")) {
+                const content_val = jsonx.get(item, "content") orelse jsonx.get(item, "text") orelse item;
+                const nested = scanUserContent(allocator, content_val, &all_outputs) catch return oom();
+                if (nested.results.len > 0 and nested.has_text) {
+                    return fail("mixed new text and tool_result in the latest user turn is not allowed");
+                }
+                if (nested.results.len > 0) {
+                    // User turn that is only tool_result blocks is live continuation.
+                    continuation.clearRetainingCapacity();
+                    continuation.appendSlice(allocator, nested.results) catch return oom();
+                    for (nested.results) |r| {
+                        appendNamed(&flatten, allocator, "tool_result", r.output) catch return oom();
+                    }
+                    continue;
+                }
                 // Later user/message after historical function_call_output is a completed
                 // follow-up (Node flushResults), not a mixed latest turn.
                 continuation.clearRetainingCapacity();
@@ -180,6 +198,7 @@ pub fn parseResponses(allocator: std.mem.Allocator, body: std.json.Value) Outcom
         .flatten_text = flatten.toOwnedSlice(allocator) catch return oom(),
         .tools = tools_list.toOwnedSlice(allocator) catch return oom(),
         .continuation = continuation.toOwnedSlice(allocator) catch return oom(),
+        .all_outputs = all_outputs.toOwnedSlice(allocator) catch return oom(),
         .compaction_trigger = trigger or jsonx.isTrue(body, "compaction_trigger"),
         .compaction_token = token,
         .include_usage = true,
@@ -238,6 +257,7 @@ fn parseTranscript(
     var last_user = std.ArrayList(u8).empty;
     var continuation = std.ArrayList(ToolResult).empty;
     var tools_list = std.ArrayList(Tool).empty;
+    var all_outputs = std.ArrayList(ToolResult).empty;
 
     if (system_field) |sys| {
         const text = jsonx.collectText(sys, allocator) catch return oom();
@@ -256,7 +276,9 @@ fn parseTranscript(
                 return fail("trailing tool message requires tool_call_id, call_id, or id");
             };
             const output = jsonx.collectText(jsonx.get(msg, "content") orelse .null, allocator) catch return oom();
-            continuation.append(allocator, .{ .call_id = call_id, .output = output }) catch return oom();
+            const taken: ToolResult = .{ .call_id = call_id, .output = output };
+            continuation.append(allocator, taken) catch return oom();
+            all_outputs.append(allocator, taken) catch return oom();
             appendNamed(&flatten, allocator, "tool_result", output) catch return oom();
             continue;
         }
@@ -307,12 +329,84 @@ fn parseTranscript(
         .flatten_text = flatten.toOwnedSlice(allocator) catch return oom(),
         .tools = tools_list.toOwnedSlice(allocator) catch return oom(),
         .continuation = continuation.toOwnedSlice(allocator) catch return oom(),
+        .all_outputs = all_outputs.toOwnedSlice(allocator) catch return oom(),
         .compaction_trigger = false,
         .compaction_token = null,
         .include_usage = kind != .chat,
         .effort = effortOf(body),
         .raw = body,
     } };
+}
+
+/// Live tool results for a pending Cursor turn: outputs whose call_id is still
+/// unresolved. Historical function_call_outputs stay in the transcript.
+/// Grok often interleaves function_call with function_call_output for parallel
+/// tools, so the trailing batch may be length 1 while all N results are in the
+/// request — Node gold's last-user-message rule drops the siblings.
+pub fn selectPendingResults(
+    allocator: std.mem.Allocator,
+    outputs: []const ToolResult,
+    pending: []const []const u8,
+) ![]ToolResult {
+    var by_id = std.StringHashMap([]const u8).init(allocator);
+    for (outputs) |o| {
+        try by_id.put(o.call_id, o.output);
+    }
+    var out = std.ArrayList(ToolResult).empty;
+    for (pending) |id| {
+        if (by_id.get(id)) |output| {
+            try out.append(allocator, .{ .call_id = id, .output = output });
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Ids Grok must fulfill this POST: the batch already sent on SSE, not
+/// CallCustomTool waiters that arrived after that snapshot. Late waiters
+/// belong on the next waitBoundary. Fall back to hub unresolved when no
+/// batch has been published yet.
+pub fn continuationRequiredIds(published: []const []const u8, unresolved: []const []const u8) []const []const u8 {
+    return if (published.len > 0) published else unresolved;
+}
+
+const UserContentScan = struct {
+    results: []ToolResult,
+    has_text: bool,
+};
+
+fn scanUserContent(
+    allocator: std.mem.Allocator,
+    content: std.json.Value,
+    all_outputs: *std.ArrayList(ToolResult),
+) !UserContentScan {
+    const parts = jsonx.asArray(content) orelse return .{ .results = &.{}, .has_text = false };
+    var results = std.ArrayList(ToolResult).empty;
+    var has_text = false;
+    for (parts) |part| {
+        if (takeOutput(allocator, part)) |o| {
+            try all_outputs.append(allocator, o);
+            try results.append(allocator, o);
+            continue;
+        }
+        const t = try jsonx.collectText(part, allocator);
+        if (std.mem.trim(u8, t, " \t\r\n").len > 0) has_text = true;
+    }
+    return .{ .results = results.toOwnedSlice(allocator) catch return error.OutOfMemory, .has_text = has_text };
+}
+
+fn takeOutput(allocator: std.mem.Allocator, item: std.json.Value) ?ToolResult {
+    const typ = jsonx.getStr(item, "type");
+    const is_out = if (typ) |t|
+        std.mem.eql(u8, t, "function_call_output") or
+            std.mem.eql(u8, t, "custom_tool_call_output") or
+            std.mem.eql(u8, t, "tool_result")
+    else
+        (jsonx.get(item, "call_id") != null and jsonx.get(item, "output") != null) or
+            jsonx.get(item, "tool_call_id") != null;
+    if (!is_out) return null;
+    const call_id = jsonx.getStr(item, "call_id") orelse jsonx.getStr(item, "tool_call_id") orelse return null;
+    const output = toolOutputText(allocator, jsonx.get(item, "output") orelse jsonx.get(item, "content")) catch return null;
+    return .{ .call_id = call_id, .output = output };
 }
 
 pub fn estimateInputTokens(parsed: Parsed) u32 {
@@ -584,6 +678,62 @@ test "responses continuation keeps parallel trailing function_call_outputs" {
     , .{});
     const out = parseResponses(arena.allocator(), parsed.value);
     try std.testing.expectEqual(@as(usize, 2), out.ok.continuation.len);
+    try std.testing.expectEqualStrings("c1", out.ok.continuation[0].call_id);
+    try std.testing.expectEqualStrings("c2", out.ok.continuation[1].call_id);
+    try std.testing.expectEqual(@as(usize, 2), out.ok.all_outputs.len);
+}
+
+test "interleaved parallel function_call_outputs keep all ids in all_outputs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(),
+        \\{"model":"grok-4.6","input":[{"type":"function_call","call_id":"c1","name":"web_search","arguments":"{}"},{"type":"function_call_output","call_id":"c1","output":"a"},{"type":"function_call","call_id":"c2","name":"web_search","arguments":"{}"},{"type":"function_call_output","call_id":"c2","output":"b"},{"type":"function_call","call_id":"c3","name":"web_search","arguments":"{}"},{"type":"function_call_output","call_id":"c3","output":"c"},{"type":"function_call","call_id":"c4","name":"read_file","arguments":"{}"},{"type":"function_call_output","call_id":"c4","output":"d"}]}
+    , .{});
+    const out = parseResponses(arena.allocator(), parsed.value);
+    try std.testing.expectEqual(@as(usize, 1), out.ok.continuation.len);
+    try std.testing.expectEqualStrings("c4", out.ok.continuation[0].call_id);
+    try std.testing.expectEqual(@as(usize, 4), out.ok.all_outputs.len);
+    const pending = [_][]const u8{ "c1", "c2", "c3", "c4" };
+    const live = try selectPendingResults(arena.allocator(), out.ok.all_outputs, &pending);
+    try std.testing.expectEqual(@as(usize, 4), live.len);
+    try std.testing.expectEqualStrings("a", live[0].output);
+    try std.testing.expectEqualStrings("d", live[3].output);
+}
+
+test "continuationRequiredIds uses published batch over later hub waiters" {
+    const published = [_][]const u8{ "a", "b" };
+    const unresolved = [_][]const u8{ "a", "b", "late" };
+    const required = continuationRequiredIds(&published, &unresolved);
+    try std.testing.expectEqual(@as(usize, 2), required.len);
+    try std.testing.expectEqualStrings("a", required[0]);
+    try std.testing.expectEqualStrings("b", required[1]);
+    const empty: []const []const u8 = &.{};
+    const fallback = continuationRequiredIds(empty, &unresolved);
+    try std.testing.expectEqual(@as(usize, 3), fallback.len);
+}
+
+test "selectPendingResults ignores historical outputs that are not pending" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const outputs = [_]ToolResult{
+        .{ .call_id = "old", .output = "stale" },
+        .{ .call_id = "new", .output = "fresh" },
+    };
+    const pending = [_][]const u8{"new"};
+    const live = try selectPendingResults(arena.allocator(), &outputs, &pending);
+    try std.testing.expectEqual(@as(usize, 1), live.len);
+    try std.testing.expectEqualStrings("new", live[0].call_id);
+}
+
+test "user message of only tool_result blocks is continuation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(),
+        \\{"model":"grok-4.6","input":[{"type":"function_call","call_id":"c1","name":"a","arguments":"{}"},{"type":"function_call","call_id":"c2","name":"b","arguments":"{}"},{"type":"message","role":"user","content":[{"type":"function_call_output","call_id":"c1","output":"one"},{"type":"function_call_output","call_id":"c2","output":"two"}]}]}
+    , .{});
+    const out = parseResponses(arena.allocator(), parsed.value);
+    try std.testing.expectEqual(@as(usize, 2), out.ok.continuation.len);
+    try std.testing.expectEqual(@as(usize, 2), out.ok.all_outputs.len);
     try std.testing.expectEqualStrings("c1", out.ok.continuation[0].call_id);
     try std.testing.expectEqualStrings("c2", out.ok.continuation[1].call_id);
 }

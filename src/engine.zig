@@ -72,6 +72,7 @@ test "fake echoes last user text" {
         .flatten_text = "user: hello zig",
         .tools = &.{},
         .continuation = &.{},
+        .all_outputs = &.{},
         .compaction_trigger = false,
         .compaction_token = null,
         .include_usage = true,

@@ -140,10 +140,11 @@ fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
         .ok => |v| v,
         .err => |e| return sendErr(reply, e, request_id, path, isOpenAi(path)),
     };
-    std.log.info("{s} tools={d} continuation={d} stream={s} session={s}", .{
+    std.log.info("{s} tools={d} continuation={d} outputs={d} stream={s} session={s}", .{
         path,
         p.tools.len,
         p.continuation.len,
+        p.all_outputs.len,
         if (p.stream) "1" else "0",
         session_hint orelse "-",
     });

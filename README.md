@@ -4,6 +4,8 @@ Zig clone of [cursor-sdk2api](https://github.com/LeviticusNelson/cursor-sdk2api)
 
 Cursor inference still goes through Cursor. This repo talks to Cursor via the official **[SDK Bridge](https://cursor.com/docs/sdk/bridge)** (`sdk.v1` Connect JSON), not by copying `@cursor/sdk` internals.
 
+There is **no C ABI** to link: `cursor-sdk-bridge` is a Bun-compiled executable, not a dylib. The Zig module `cursor-sdk-bridge` (`src/sdk.zig`) is the Connect adapter library Cursor documents for languages without a first-party SDK.
+
 | Process | Bind | Role |
 |---|---|---|
 | Node `cursor-sdk2api` (gold) | `127.0.0.1:8080` | Existing gateway. Do not change its official-SDK rule. |
@@ -27,9 +29,19 @@ See [docs/design.md](docs/design.md).
 
 ## Run
 
+Daily driver on `127.0.0.1:8080` (Grok CIDR models). The Grok plugin `grok-plugin/` starts a **ReleaseFast** binary when a session starts:
+
 ```bash
 zig build test
-zig build run
+zig build --release=fast
+~/.cursor-sdk2api-zig/start.sh   # builds --release=fast if the binary is missing/stale
+# GET http://127.0.0.1:8080/health  → service=cursor-sdk2api-zig, cursor.inference=sdk-bridge
+```
+
+`zig build` / `zig build run` default to ReleaseFast (`-Drelease`). Debug:
+
+```bash
+zig build -Drelease=false run
 # GET http://127.0.0.1:8081/health
 ```
 

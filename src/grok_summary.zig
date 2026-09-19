@@ -31,6 +31,7 @@ test "detects Grok compact summary prompt" {
         .flatten_text = "user: hi",
         .tools = &.{},
         .continuation = &.{},
+        .all_outputs = &.{},
         .compaction_trigger = false,
         .compaction_token = null,
         .include_usage = true,

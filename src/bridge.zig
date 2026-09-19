@@ -147,34 +147,40 @@ pub const Bridge = struct {
     }
 
     fn applyContinuation(self: *Bridge, arena: std.mem.Allocator, live: *Live, parsed: protocol.Parsed) !void {
-        const pending = try self.hub.unresolvedIds(arena, live.agent_id);
-        var unknown = std.ArrayList([]const u8).empty;
-        var provided = std.StringHashMap(void).init(arena);
-        for (parsed.continuation) |c| {
-            try provided.put(c.call_id, {});
-            var found = false;
+        const hub_pending = try self.hub.unresolvedIds(arena, live.agent_id);
+        const published = try copyIds(arena, live.published_ids.items);
+        const pending = protocol.continuationRequiredIds(published, hub_pending);
+        const pool: []const protocol.ToolResult = if (parsed.all_outputs.len > 0) parsed.all_outputs else parsed.continuation;
+        const live_results = try protocol.selectPendingResults(arena, pool, pending);
+        std.log.info("continue pending={d} published={d} hub={d} trailing={d} outputs={d} live={d}", .{
+            pending.len,
+            published.len,
+            hub_pending.len,
+            parsed.continuation.len,
+            pool.len,
+            live_results.len,
+        });
+        if (pending.len == 0) {
+            self.last_err = "Session is not waiting for tool results";
+            return error.SessionLost;
+        }
+        if (live_results.len != pending.len) {
+            var missing = std.ArrayList([]const u8).empty;
+            var provided = std.StringHashMap(void).init(arena);
+            for (live_results) |c| try provided.put(c.call_id, {});
             for (pending) |id| {
-                if (std.mem.eql(u8, id, c.call_id)) {
-                    found = true;
-                    break;
-                }
+                if (provided.get(id) == null) try missing.append(arena, id);
             }
-            if (!found) try unknown.append(arena, c.call_id);
-        }
-        if (unknown.items.len > 0) {
-            self.last_err = try std.fmt.allocPrint(arena, "unknown tool_use_id: {s}", .{try joinIds(arena, unknown.items)});
-            return error.UnknownToolId;
-        }
-        var missing = std.ArrayList([]const u8).empty;
-        for (pending) |id| {
-            if (provided.get(id) == null) try missing.append(arena, id);
-        }
-        if (missing.items.len > 0) {
+            // Grok sent ids that are not pending and none of the pending ids: unknown.
+            if (live_results.len == 0 and parsed.continuation.len > 0) {
+                self.last_err = try std.fmt.allocPrint(arena, "unknown tool_use_id: {s}", .{parsed.continuation[0].call_id});
+                return error.UnknownToolId;
+            }
             self.last_err = try std.fmt.allocPrint(arena, "missing tool_result for: {s}", .{try joinIds(arena, missing.items)});
             return error.MissingToolResult;
         }
         live.resetSegment();
-        for (parsed.continuation) |c| {
+        for (live_results) |c| {
             if (!self.hub.fulfill(c.call_id, c.output)) {
                 self.last_err = try std.fmt.allocPrint(arena, "unknown tool_use_id: {s}", .{c.call_id});
                 return error.UnknownToolId;
@@ -191,16 +197,32 @@ pub const Bridge = struct {
         session_id: []const u8,
         now: i64,
     ) !encode.Turn {
+        // Parallel CallCustomTool RPCs arrive a few dozen ms apart. Returning on
+        // the first announcement dropped siblings and Grok only saw part of the batch.
+        // Flush immediately on turn-ended (Node EventPump) so we do not wait out
+        // the settle window after Cursor has scheduled every execute callback.
+        var last_n: usize = 0;
+        var stable_ticks: u32 = 0;
         while (true) {
             if (live.failed) return error.BridgeRpcFailed;
-            if (self.hub.unresolvedCount(live.agent_id) > 0) {
-                sleepMs(self.io, 50);
-                break;
+            const n = self.hub.unresolvedCount(live.agent_id);
+            if (n > 0) {
+                if (live.batchReady()) break;
+                if (n == last_n) {
+                    stable_ticks += 1;
+                    if (stable_ticks >= 8) break; // ~160ms with no new tools
+                } else {
+                    last_n = n;
+                    stable_ticks = 0;
+                }
+                sleepMs(self.io, 20);
+                continue;
             }
             if (live.finished) break;
             sleepMs(self.io, 5);
         }
         const snaps = try self.hub.snapshotUnresolved(arena, live.agent_id);
+        live.replacePublished(snaps) catch {};
         live.mu.lockUncancelable(self.io);
         const text = try arena.dupe(u8, live.text.items);
         const thinking = try arena.dupe(u8, live.thinking.items);
@@ -309,6 +331,8 @@ const Live = struct {
     agent_id: []u8,
     session_id: []u8,
     catalog: []protocol.Tool = &.{},
+    published_ids: std.ArrayList([]u8) = .empty,
+    batch_ready: bool = false,
 
     fn setSink(self: *Live, sink: Sink) void {
         self.mu.lockUncancelable(self.io);
@@ -323,12 +347,26 @@ const Live = struct {
         self.thinking.clearRetainingCapacity();
         self.finished = false;
         self.failed = false;
+        self.batch_ready = false;
     }
 
     fn finish(self: *Live) void {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         self.finished = true;
+        self.batch_ready = true;
+    }
+
+    fn markBatchReady(self: *Live) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        self.batch_ready = true;
+    }
+
+    fn batchReady(self: *Live) bool {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return self.batch_ready;
     }
 
     fn fail(self: *Live) void {
@@ -336,6 +374,15 @@ const Live = struct {
         defer self.mu.unlock(self.io);
         self.failed = true;
         self.finished = true;
+        self.batch_ready = true;
+    }
+
+    fn replacePublished(self: *Live, snaps: []const toolcb.WaiterSnap) !void {
+        for (self.published_ids.items) |id| self.gpa.free(id);
+        self.published_ids.clearRetainingCapacity();
+        for (snaps) |s| {
+            try self.published_ids.append(self.gpa, try self.gpa.dupe(u8, s.call_id));
+        }
     }
 };
 
@@ -395,6 +442,10 @@ fn applyEnvelope(arena: std.mem.Allocator, payload: []const u8, live: *Live) !vo
     const parsed = std.json.parseFromSlice(std.json.Value, arena, payload, .{}) catch return;
     if (jsonx.get(parsed.value, "interactionUpdate")) |upd| {
         const typ = jsonx.getStr(upd, "type") orelse return;
+        if (std.mem.eql(u8, typ, "turn-ended") or std.mem.eql(u8, typ, "turn_ended")) {
+            live.markBatchReady();
+            return;
+        }
         const piece = blk: {
             const u = jsonx.get(upd, "update") orelse break :blk "";
             break :blk jsonx.getStr(u, "text") orelse jsonx.getStr(u, "delta") orelse "";
@@ -454,6 +505,12 @@ fn appendLive(live: *Live, kind: LiveKind, piece: []const u8) void {
 fn sleepMs(io: Io, ms: i64) void {
     const d: Io.Clock.Duration = .{ .raw = .fromMilliseconds(ms), .clock = .real };
     d.sleep(io) catch {};
+}
+
+fn copyIds(arena: std.mem.Allocator, ids: []const []u8) ![]const []const u8 {
+    const out = try arena.alloc([]const u8, ids.len);
+    for (ids, 0..) |id, i| out[i] = id;
+    return out;
 }
 
 fn joinIds(arena: std.mem.Allocator, ids: []const []const u8) ![]u8 {
