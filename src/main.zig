@@ -74,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
         };
         cb_server = try cb_addr.listen(io, .{ .reuse_address = true });
         hub.token = cb_token;
-        group.async(io, toolcb.acceptLoop, .{ io, &cb_server, &hub });
+        spawnTask(&group, io, toolcb.acceptLoop, .{ io, &cb_server, &hub });
         std.log.info("tool callback {s}", .{cb_url});
     }
 
@@ -127,8 +127,12 @@ pub fn main(init: std.process.Init) !void {
 
     while (true) {
         const stream = try listener.accept(io);
-        group.async(io, accept, .{ io, &app, stream });
+        spawnTask(&group, io, accept, .{ io, &app, stream });
     }
+}
+
+fn spawnTask(group: *Io.Group, io: Io, comptime function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
+    group.concurrent(io, function, args) catch group.async(io, function, args);
 }
 
 fn accept(io: Io, app: *httpx.App, stream: Io.net.Stream) void {

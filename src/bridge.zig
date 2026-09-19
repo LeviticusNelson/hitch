@@ -118,7 +118,7 @@ pub const Bridge = struct {
         self.mu.lockUncancelable(self.io);
         try self.lives.put(live.session_id, live);
         self.mu.unlock(self.io);
-        self.group.async(self.io, sendLoop, .{live});
+        self.group.concurrent(self.io, sendLoop, .{live}) catch self.group.async(self.io, sendLoop, .{live});
         defer live.setSink(.{});
         return self.waitBoundary(arena, live, parsed, message_id, session_id, now);
     }

@@ -201,7 +201,7 @@ pub fn acceptLoop(io: Io, listener: *Io.net.Server, hub: *Hub) void {
             std.log.err("tool callback accept: {t}", .{err});
             return;
         };
-        group.async(io, handleConn, .{ io, stream, hub });
+        group.concurrent(io, handleConn, .{ io, stream, hub }) catch group.async(io, handleConn, .{ io, stream, hub });
     }
 }
 
