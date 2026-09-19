@@ -54,6 +54,9 @@ pub fn main(init: std.process.Init) !void {
             .api_key = key,
         };
         app.catalog = &catalog_store;
+        var warm_arena = std.heap.ArenaAllocator.init(gpa);
+        defer warm_arena.deinit();
+        catalog_store.warm(warm_arena.allocator());
     }
 
     var group: Io.Group = .init;

@@ -87,7 +87,12 @@ def main() -> int:
     status, raw, _ = req("GET", "/v1/models")
     models = json_body(raw) or {}
     items = models.get("data") or models.get("items") or []
-    expect("GET /v1/models", status == 200 and len(items) > 0, f"n={len(items)}")
+    cache = models.get("cache") or {}
+    expect(
+        "GET /v1/models",
+        status == 200 and len(items) >= 10,
+        f"n={len(items)} stale={cache.get('stale')}",
+    )
 
     status, raw, _ = req("GET", "/v1/account")
     expect("GET /v1/account", status in (200, 401, 403), f"status={status}")

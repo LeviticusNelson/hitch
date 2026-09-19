@@ -562,10 +562,14 @@ fn writeSse(body: *rawhttp.Reply, bytes: []const u8) !void {
 fn modelsJson(app: *App, arena: std.mem.Allocator, user_agent: ?[]const u8) ![]u8 {
     var listed = std.ArrayList(cursor_api.Model).empty;
     var live_ok = false;
+    var stale_cache = false;
     if (app.catalog) |cat| {
-        if (cat.listModels(arena)) |live| {
-            try listed.appendSlice(arena, live);
-            live_ok = live.len > 0;
+        if (cat.listModels(arena)) |result| {
+            if (result.models.len > 0) {
+                try listed.appendSlice(arena, result.models);
+                live_ok = true;
+                stale_cache = result.stale;
+            }
         } else |_| {}
     }
     if (!live_ok) {
@@ -573,6 +577,7 @@ fn modelsJson(app: *App, arena: std.mem.Allocator, user_agent: ?[]const u8) ![]u
         for (ids_list) |id| {
             try listed.append(arena, .{ .id = id, .display_name = id });
         }
+        stale_cache = true;
     }
     var out = std.ArrayList(u8).empty;
     try out.appendSlice(arena, "{\"object\":\"list\",\"data\":[");
@@ -594,7 +599,7 @@ fn modelsJson(app: *App, arena: std.mem.Allocator, user_agent: ?[]const u8) ![]u
             ));
         }
     }
-    const stale: []const u8 = if (app.catalog != null and !live_ok) "true" else "false";
+    const stale: []const u8 = if (stale_cache) "true" else "false";
     try out.appendSlice(arena, "],\"status\":\"ok\",\"cache\":{\"stale\":");
     try out.appendSlice(arena, stale);
     try out.appendSlice(arena, "}}");
