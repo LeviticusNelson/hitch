@@ -1,0 +1,6 @@
+{
+  "name": "hitch",
+  "description": "Start Hitch (Zig Cursor gateway) so Grok CIDR models stay on 127.0.0.1:8080. Inspired by cursor-sdk2api.",
+  "version": "0.1.0",
+  "keywords": ["cursor", "hitch", "cursor-sdk2api", "zig", "gateway", "grok"]
+}

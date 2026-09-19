@@ -44,7 +44,15 @@ cp env.example ~/.hitch/env        # add your Cursor key
 
 `GET http://127.0.0.1:8080/health` → `service=hitch`, `cursor.inference=sdk-bridge`.
 
-The Grok plugin ships the prebuilt **hitch** binary and starts it on session start. It does not compile.
+Install the Grok plugin from a built binary (no source tree required):
+
+```bash
+./zig-out/bin/hitch install-plugin
+# or, after copying hitch onto PATH:
+hitch install-plugin
+```
+
+That writes `~/.grok/plugins/hitch`, copies this binary to `bin/hitch`, installs `~/.hitch/start.sh`, and enables hitch in `~/.grok/config.toml` when possible. SessionStart / UserPromptSubmit then start Hitch; they do not compile.
 
 ## License
 

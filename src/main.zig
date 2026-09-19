@@ -21,8 +21,31 @@ const toolcb = @import("toolcb.zig");
 const rawhttp = @import("rawhttp.zig");
 
 const version = config_mod.version;
+const install = @import("install.zig");
 
 pub fn main(init: std.process.Init) !void {
+    var argv = std.process.Args.Iterator.init(init.minimal.args);
+    _ = argv.next();
+    if (argv.next()) |cmd| {
+        if (std.mem.eql(u8, cmd, "install-plugin")) return install.run(init);
+        if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "--version")) {
+            std.debug.print("hitch {s}\n", .{version});
+            return;
+        }
+        if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
+            std.debug.print(
+                \\hitch {s} — Cursor models on the APIs your harness already speaks
+                \\
+                \\Usage:
+                \\  hitch                  start the gateway (env HOST/PORT)
+                \\  hitch install-plugin   install the Grok plugin from this binary
+                \\  hitch version
+                \\
+            , .{version});
+            return;
+        }
+    }
+
     const io = init.io;
     const arena = init.arena.allocator();
     const cfg = try config_mod.Config.fromEnv(init.environ_map, arena);
