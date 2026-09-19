@@ -87,9 +87,10 @@ pub const Bridge = struct {
         sink: Sink,
     ) !encode.Turn {
         if (parsed.continuation.len > 0) {
+            try self.preflightContinuation(arena, parsed, session_id);
             const live = self.liveForContinuation(session_id, parsed.continuation) orelse {
-                self.last_err = "Session is not waiting for tool results";
-                return error.SessionLost;
+                self.last_err = try std.fmt.allocPrint(arena, "unknown tool_use_id: {s}", .{parsed.continuation[0].call_id});
+                return error.UnknownToolId;
             };
             try self.applyContinuation(arena, live, parsed);
             live.setSink(sink);
@@ -129,6 +130,28 @@ pub const Bridge = struct {
         return self.lives.get(session_id);
     }
 
+    /// Fail closed before SSE: orphan function_call_output is unknown tool_use_id, not a 200 stream.
+    pub fn preflightContinuation(self: *Bridge, arena: std.mem.Allocator, parsed: protocol.Parsed, session_id: []const u8) !void {
+        if (parsed.continuation.len == 0) return;
+        const live = self.liveForContinuation(session_id, parsed.continuation) orelse {
+            self.last_err = try std.fmt.allocPrint(arena, "unknown tool_use_id: {s}", .{parsed.continuation[0].call_id});
+            return error.UnknownToolId;
+        };
+        const hub_pending = try self.hub.unresolvedIds(arena, live.agent_id);
+        const published = try copyIds(arena, live.published_ids.items);
+        const pending = protocol.continuationRequiredIds(published, hub_pending);
+        const pool: []const protocol.ToolResult = if (parsed.all_outputs.len > 0) parsed.all_outputs else parsed.continuation;
+        const live_results = try protocol.selectPendingResults(arena, pool, pending);
+        if (pending.len == 0 or live_results.len == 0) {
+            self.last_err = try std.fmt.allocPrint(arena, "unknown tool_use_id: {s}", .{parsed.continuation[0].call_id});
+            return error.UnknownToolId;
+        }
+        if (live_results.len != pending.len) {
+            self.last_err = try std.fmt.allocPrint(arena, "missing tool_result for: {s}", .{try joinIds(arena, pending)});
+            return error.MissingToolResult;
+        }
+    }
+
     fn liveForContinuation(self: *Bridge, session_id: []const u8, continuation: []const protocol.ToolResult) ?*Live {
         if (self.getLive(session_id)) |live| return live;
         for (continuation) |c| {
@@ -161,6 +184,10 @@ pub const Bridge = struct {
             live_results.len,
         });
         if (pending.len == 0) {
+            if (parsed.continuation.len > 0) {
+                self.last_err = try std.fmt.allocPrint(arena, "unknown tool_use_id: {s}", .{parsed.continuation[0].call_id});
+                return error.UnknownToolId;
+            }
             self.last_err = "Session is not waiting for tool results";
             return error.SessionLost;
         }

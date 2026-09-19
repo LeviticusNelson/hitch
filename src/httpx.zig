@@ -201,6 +201,17 @@ fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
         return writeTurn(reply, arena, p, turn, request_id);
     }
 
+    if (p.continuation.len > 0) {
+        br.preflightContinuation(arena, p, sid) catch |err| {
+            const msg = if (br.last_err.len > 0) br.last_err else @errorName(err);
+            const gw = switch (err) {
+                error.UnknownToolId, error.MissingToolResult => errors.invalidRequest(msg),
+                else => return err,
+            };
+            return sendErr(reply, gw, request_id, path, isOpenAi(path));
+        };
+    }
+
     try reply.beginSse(&.{
         .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
         .{ .name = "x-request-id", .value = request_id },

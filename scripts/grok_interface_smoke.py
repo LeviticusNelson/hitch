@@ -24,6 +24,8 @@ def req(method: str, path: str, body: dict | None = None, stream: bool = False, 
             return resp.status, raw, ctype
     except urllib.error.HTTPError as e:
         return e.code, e.read(), e.headers.get("content-type", "")
+    except TimeoutError as e:
+        return 0, str(e).encode(), "timeout"
 
 
 def expect(name: str, ok: bool, detail: str = ""):
