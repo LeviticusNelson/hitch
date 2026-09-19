@@ -15,6 +15,7 @@ const ids = @import("ids.zig");
 const jsonx = @import("jsonx.zig");
 const models = @import("models.zig");
 const protocol = @import("protocol.zig");
+const toolcb = @import("toolcb.zig");
 
 const version = config_mod.version;
 
@@ -52,12 +53,33 @@ pub fn main(init: std.process.Init) !void {
         app.catalog = &catalog_store;
     }
 
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+
+    var cb_server: Io.net.Server = undefined;
+    var cb_url: []const u8 = "";
+    var cb_token: []const u8 = "";
+    if (!cfg.fake_cursor and cfg.cursor_api_key != null) {
+        var tok: [16]u8 = undefined;
+        io.random(&tok);
+        const hex = std.fmt.bytesToHex(tok, .lower);
+        cb_token = try arena.dupe(u8, hex[0..]);
+        cb_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{cfg.tool_callback_port});
+        const cb_addr = Io.net.IpAddress.parse("127.0.0.1", cfg.tool_callback_port) catch |err| {
+            std.log.err("tool callback address: {t}", .{err});
+            return err;
+        };
+        cb_server = try cb_addr.listen(io, .{ .reuse_address = true });
+        group.async(io, toolcb.acceptLoop, .{ io, &cb_server, cb_token, arena });
+        std.log.info("tool callback {s}", .{cb_url});
+    }
+
     var live_bridge: ?bridge.Bridge = null;
     var bridge_client: httpx.BridgeClient = undefined;
     if (!cfg.fake_cursor) {
         if (bridge.findBridgeBinary(init.environ_map, arena)) |bin| {
             if (cfg.cursor_api_key) |key| {
-                if (bridge.spawn(io, arena, init.environ_map, bin, cfg.workspace_dir, key)) |spawned| {
+                if (bridge.spawn(io, arena, init.environ_map, bin, cfg.workspace_dir, key, cb_url, cb_token)) |spawned| {
                     live_bridge = spawned;
                 } else |err| {
                     std.log.warn("official sdk-bridge spawn failed ({t}); catalog stays native, inference unavailable", .{err});
@@ -99,9 +121,6 @@ pub fn main(init: std.process.Init) !void {
         if (app.use_fake) "fake" else if (app.cursor_bridge != null) "sdk-bridge" else "unavailable",
     });
 
-    var group: Io.Group = .init;
-    defer group.cancel(io);
-
     while (true) {
         const stream = try listener.accept(io);
         group.async(io, accept, .{ io, &app, stream });
@@ -110,22 +129,20 @@ pub fn main(init: std.process.Init) !void {
 
 fn accept(io: Io, app: *httpx.App, stream: Io.net.Stream) void {
     defer stream.close(io);
-    var recv_buffer: [8192]u8 = undefined;
-    var send_buffer: [8192]u8 = undefined;
+    var recv_buffer: [65536]u8 = undefined;
+    var send_buffer: [16384]u8 = undefined;
     var conn_reader = stream.reader(io, &recv_buffer);
     var conn_writer = stream.writer(io, &send_buffer);
     var server = std.http.Server.init(&conn_reader.interface, &conn_writer.interface);
 
-    while (server.reader.state == .ready) {
-        var request = server.receiveHead() catch |err| switch (err) {
-            error.HttpConnectionClosing => return,
-            else => {
-                std.log.err("closing http connection: {t}", .{err});
-                return;
-            },
-        };
-        httpx.handle(app, &request);
-    }
+    var request = server.receiveHead() catch |err| switch (err) {
+        error.HttpConnectionClosing => return,
+        else => {
+            std.log.err("closing http connection: {t}", .{err});
+            return;
+        },
+    };
+    httpx.handle(app, &request);
 }
 
 fn bridgeUnary(client: *httpx.BridgeClient, allocator: std.mem.Allocator, path: []const u8, payload: []const u8) anyerror![]u8 {
@@ -154,6 +171,7 @@ test {
     _ = bridge;
     _ = cursor_api;
     _ = @import("session.zig");
+    _ = toolcb;
 }
 
 fn pathOnly(target: []const u8) []const u8 {

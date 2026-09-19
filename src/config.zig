@@ -17,7 +17,7 @@ pub const Config = struct {
     max_body_bytes: usize = 8 * 1024 * 1024,
     fake_cursor: bool = false,
     instance_id: ?[]const u8 = null,
-    tool_callback_port: u16 = 18081,
+    tool_callback_port: u16 = 18771,
 
     pub fn fromEnv(env: *const std.process.Environ.Map, allocator: std.mem.Allocator) !Config {
         var c: Config = .{};

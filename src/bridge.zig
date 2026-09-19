@@ -304,10 +304,27 @@ pub fn findBridgeBinary(env: *const std.process.Environ.Map, allocator: std.mem.
     return candidate;
 }
 
-pub fn spawn(io: Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, bin: []const u8, workspace: []const u8, api_key: []const u8) !Bridge {
+pub fn spawn(
+    io: Io,
+    gpa: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    bin: []const u8,
+    workspace: []const u8,
+    api_key: []const u8,
+    tool_callback_url: []const u8,
+    tool_callback_token: []const u8,
+) !Bridge {
     std.Io.Dir.cwd().createDirPath(io, workspace) catch {};
     const child = try std.process.spawn(io, .{
-        .argv = &.{ bin, "--workspace", workspace },
+        .argv = &.{
+            bin,
+            "--workspace",
+            workspace,
+            "--tool-callback-url",
+            tool_callback_url,
+            "--tool-callback-auth-token",
+            tool_callback_token,
+        },
         .stderr = .pipe,
         .stdout = .ignore,
     });

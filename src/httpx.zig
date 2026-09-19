@@ -42,6 +42,7 @@ pub fn handle(app: *App, request: *std.http.Server.Request) void {
         const body = encode.publicErrorJson(arena, errors.upstreamError("internal error"), "req_unknown") catch return;
         request.respond(body, .{
             .status = .internal_server_error,
+            .keep_alive = false,
             .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
         }) catch {};
     };
@@ -50,13 +51,14 @@ pub fn handle(app: *App, request: *std.http.Server.Request) void {
 fn serve(app: *App, request: *std.http.Server.Request, arena: std.mem.Allocator) !void {
     var headers_buf: [48]std.http.Header = undefined;
     const headers = copyHeaders(request, arena, &headers_buf) catch return error.OutOfMemory;
-    const path = pathOnly(request.head.target);
+    const path = canonicalizePath(pathOnly(request.head.target));
     const method = request.head.method;
+    std.log.info("{s} {s}", .{ @tagName(method), path });
     const request_id = headers.get("x-request-id") orelse try ids.requestId(app.io, arena);
     const session_hint = headers.get("x-cursor-session-id");
     const user_agent = headers.get("user-agent");
 
-    if (method == .GET and (std.mem.eql(u8, path, "/health") or std.mem.eql(u8, path, "/"))) {
+    if (method == .GET and (std.mem.eql(u8, path, "/health") or std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/v1"))) {
         const catalog_mode: []const u8 = if (app.catalog != null) "native" else "fake";
         const inference_mode: []const u8 = if (app.use_fake) "fake" else if (app.cursor_bridge != null) "sdk-bridge" else "unavailable";
         const body = try encode.healthJson(arena, config_mod.version, app.instance_id, app.sdk_version, true, catalog_mode, inference_mode);
@@ -94,8 +96,21 @@ fn serve(app: *App, request: *std.http.Server.Request, arena: std.mem.Allocator)
         return sendJson(request, .ok, json, request_id, null);
     }
 
+    if (method == .OPTIONS) {
+        return request.respond("", .{
+            .status = .no_content,
+            .keep_alive = false,
+            .extra_headers = &.{
+                .{ .name = "access-control-allow-origin", .value = "*" },
+                .{ .name = "access-control-allow-headers", .value = "*" },
+                .{ .name = "access-control-allow-methods", .value = "GET,POST,OPTIONS" },
+            },
+        });
+    }
+
     if (method != .POST) {
-        return sendErr(request, errors.notFound("No route"), request_id, path, false);
+        std.log.warn("no route for {s} {s}", .{ @tagName(method), path });
+        return sendErr(request, errors.notFound("No route"), request_id, path, isOpenAi(path));
     }
 
     if (body_bytes.len == 0) {
@@ -120,16 +135,18 @@ fn serve(app: *App, request: *std.http.Server.Request, arena: std.mem.Allocator)
         protocol.parseMessages(arena, parsed_json)
     else if (std.mem.eql(u8, path, "/v1/chat/completions"))
         protocol.parseChat(arena, parsed_json)
-    else if (std.mem.eql(u8, path, "/v1/responses") or std.mem.eql(u8, path, "/v1/responses/compact"))
+    else if (isResponsesPath(path) or isCompactPath(path))
         protocol.parseResponses(arena, parsed_json)
-    else
-        return sendErr(request, errors.notFound("No route"), request_id, path, false);
+    else {
+        std.log.warn("no route for {s} {s}", .{ @tagName(method), path });
+        return sendErr(request, errors.notFound("No route"), request_id, path, isOpenAi(path));
+    };
     const p = switch (parsed) {
         .ok => |v| v,
         .err => |e| return sendErr(request, e, request_id, path, isOpenAi(path)),
     };
 
-    if (std.mem.eql(u8, path, "/v1/responses/compact") or p.compaction_trigger) {
+    if (isCompactPath(path) or p.compaction_trigger) {
         const compact_id = try ids.compactId(app.io, arena);
         const minted = app.compact.mint(arena, compact_id, p.model) catch {
             return sendErr(request, errors.upstreamError("compact failed"), request_id, path, true);
@@ -182,6 +199,7 @@ fn serve(app: *App, request: *std.http.Server.Request, arena: std.mem.Allocator)
     var buf: [2048]u8 = undefined;
     var body = try request.respondStreaming(&buf, .{
         .respond_options = .{
+            .keep_alive = false,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
                 .{ .name = "cache-control", .value = "no-cache, no-transform" },
@@ -269,6 +287,7 @@ fn writeTurn(request: *std.http.Server.Request, arena: std.mem.Allocator, parsed
     var buf: [2048]u8 = undefined;
     var body = try request.respondStreaming(&buf, .{
         .respond_options = .{
+            .keep_alive = false,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
                 .{ .name = "cache-control", .value = "no-cache, no-transform" },
@@ -367,6 +386,7 @@ fn writeCompactSse(request: *std.http.Server.Request, arena: std.mem.Allocator, 
     var buf: [1024]u8 = undefined;
     var body = try request.respondStreaming(&buf, .{
         .respond_options = .{
+            .keep_alive = false,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
                 .{ .name = "x-request-id", .value = request_id },
@@ -451,6 +471,7 @@ fn sendJson(request: *std.http.Server.Request, status: std.http.Status, body: []
     if (session_id) |sid| {
         return request.respond(body, .{
             .status = status,
+            .keep_alive = false,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json; charset=utf-8" },
                 .{ .name = "x-request-id", .value = request_id },
@@ -461,6 +482,7 @@ fn sendJson(request: *std.http.Server.Request, status: std.http.Status, body: []
     }
     return request.respond(body, .{
         .status = status,
+        .keep_alive = false,
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/json; charset=utf-8" },
             .{ .name = "x-request-id", .value = request_id },
@@ -479,6 +501,7 @@ fn sendErr(request: *std.http.Server.Request, err: errors.Error, request_id: []c
     const status: std.http.Status = @enumFromInt(err.http_status);
     try request.respond(json, .{
         .status = status,
+        .keep_alive = false,
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/json; charset=utf-8" },
             .{ .name = "x-request-id", .value = request_id },
@@ -487,9 +510,16 @@ fn sendErr(request: *std.http.Server.Request, err: errors.Error, request_id: []c
 }
 
 fn isOpenAi(path: []const u8) bool {
-    return std.mem.eql(u8, path, "/v1/chat/completions") or
-        std.mem.eql(u8, path, "/v1/responses") or
-        std.mem.eql(u8, path, "/v1/responses/compact");
+    return std.mem.indexOf(u8, path, "/chat/completions") != null or
+        std.mem.indexOf(u8, path, "/responses") != null;
+}
+
+fn isResponsesPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/v1/responses") or std.mem.endsWith(u8, path, "/v1/responses");
+}
+
+fn isCompactPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/v1/responses/compact") or std.mem.endsWith(u8, path, "/v1/responses/compact");
 }
 
 fn unixNow(io: Io) i64 {
@@ -499,6 +529,13 @@ fn unixNow(io: Io) i64 {
 fn pathOnly(target: []const u8) []const u8 {
     const q = std.mem.indexOfScalar(u8, target, '?') orelse return target;
     return target[0..q];
+}
+
+fn canonicalizePath(path: []const u8) []const u8 {
+    var p = path;
+    while (std.mem.startsWith(u8, p, "/v1/v1/")) p = p[3..];
+    if (p.len > 1 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
+    return p;
 }
 
 fn copyHeaders(request: *std.http.Server.Request, arena: std.mem.Allocator, buf: []std.http.Header) !auth.HeaderSet {
