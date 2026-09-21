@@ -163,7 +163,7 @@ fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
         std.log.warn("no route for {s} {s}", .{ @tagName(method), path });
         return sendErr(reply, errors.notFound("No route"), request_id, path, isOpenAi(path));
     };
-    const p = switch (parsed) {
+    var p = switch (parsed) {
         .ok => |v| v,
         .err => |e| return sendErr(reply, e, request_id, path, isOpenAi(path)),
     };
@@ -242,13 +242,26 @@ fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
     }
 
     if (p.continuation.len > 0) {
+        if (br.liveForContinuation(sid, p.continuation) == null) {
+            _ = br.restorePending(arena, p, sid) catch null;
+        }
         br.preflightContinuation(arena, p, sid) catch |err| {
-            const msg = if (br.last_err.len > 0) br.last_err else @errorName(err);
-            const gw = switch (err) {
-                error.UnknownToolId, error.MissingToolResult => errors.invalidRequest(msg),
-                else => return err,
-            };
-            return sendErr(reply, gw, request_id, path, isOpenAi(path));
+            const recoverable = (err == error.UnknownToolId or err == error.MissingToolResult) and
+                protocol.canRecoverUnknownContinuation(p);
+            if (!recoverable) {
+                const msg = if (br.last_err.len > 0) br.last_err else @errorName(err);
+                const gw = switch (err) {
+                    error.UnknownToolId, error.MissingToolResult => errors.invalidRequest(msg),
+                    else => return err,
+                };
+                return sendErr(reply, gw, request_id, path, isOpenAi(path));
+            }
+            std.log.warn("continuation lost ({s}); recovering as new turn outputs={d} trailing={d}", .{
+                if (br.last_err.len > 0) br.last_err else @errorName(err),
+                p.all_outputs.len,
+                p.continuation.len,
+            });
+            p.continuation = &.{};
         };
     }
 

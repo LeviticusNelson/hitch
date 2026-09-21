@@ -105,7 +105,6 @@ pub const Bridge = struct {
                 return error.UnknownToolId;
             };
             try self.applyContinuation(arena, live_ptr, parsed);
-            if (self.persist_path.len > 0) persist.removeSession(self.io, self.persist_path, live_ptr.session_id, arena);
             if (restored) {
                 const send_json_tmp = try std.fmt.allocPrint(arena,
                     "{{\"agentId\":{f},\"message\":{{\"text\":\"\"}},\"options\":{{\"enableDeltas\":true,\"local\":{{\"force\":true}}}}}}",
@@ -201,7 +200,7 @@ pub const Bridge = struct {
         }
     }
 
-    fn liveForContinuation(self: *Bridge, session_id: []const u8, continuation: []const protocol.ToolResult) ?*Live {
+    pub fn liveForContinuation(self: *Bridge, session_id: []const u8, continuation: []const protocol.ToolResult) ?*Live {
         if (self.getLive(session_id)) |live| return live;
         for (continuation) |c| {
             const w = self.hub.get(c.call_id) orelse continue;
@@ -417,7 +416,7 @@ pub const Bridge = struct {
         return self.unary(arena, "/sdk.v1.SdkAgentService/CreateAgent", create);
     }
 
-    fn restorePending(self: *Bridge, arena: std.mem.Allocator, parsed: protocol.Parsed, session_id: []const u8) !?*Live {
+    pub fn restorePending(self: *Bridge, arena: std.mem.Allocator, parsed: protocol.Parsed, session_id: []const u8) !?*Live {
         if (self.persist_path.len == 0) return null;
         const recs = persist.loadAll(self.io, self.persist_path, arena) catch return null;
         var match: ?persist.Record = null;

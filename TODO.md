@@ -77,7 +77,7 @@ Last reviewed: 2026-09-19 (pending jsonl, lineage hash, managed pool, run caps).
 |---|---|---|
 | `x-cursor-session-id` completed follow-up (`Agent.resume`) E2E | done | Reuse agent; Send last user turn only |
 | Ordinary next turn without session header | done | `digest.stripLastUserBlock` + lineage map; lookup prefix, store full flatten |
-| Pending-tool restart after gateway kill | done | `state_dir/pending.jsonl`; restore waiters; Send `local.force=true` |
+| Pending-tool restart after gateway kill | done | Restore from `pending.jsonl` **before** HTTP preflight; unknown ids with extra transcript recover as a new turn (Grok retry after restart). Persist stays until `waitBoundary` rewrite |
 | Duplicate-same request digest replay | done | SHA-256 of body, non-stream |
 | Persist lineage across process restart | partial | Lineage is in-memory; pending tools jsonl survives kill |
 
