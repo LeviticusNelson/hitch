@@ -429,7 +429,7 @@ pub const Bridge = struct {
             "{{\"options\":{{\"model\":{{\"id\":{f}{s}}},\"apiKey\":{f},\"local\":{{\"cwd\":[{f}]{s}}},\"disallowedTools\":[\"shell\",\"read\",\"edit\",\"task\",\"webSearch\",\"webFetch\"]{s}}}}}",
             .{
                 std.json.fmt(parsed.upstream_model, .{}),
-                try effortJson(arena, parsed.effort),
+                try effortJson(arena, models.cursorEffortParam(parsed.upstream_model, parsed.effort)),
                 std.json.fmt(api_key, .{}),
                 std.json.fmt(self.workspace, .{}),
                 try customToolsJson(arena, parsed.tools),
