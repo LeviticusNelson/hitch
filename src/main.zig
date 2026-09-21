@@ -227,7 +227,6 @@ test {
     _ = protocol;
     _ = bridge;
     _ = cursor_api;
-    _ = @import("session.zig");
     _ = toolcb;
     _ = rawhttp;
 }

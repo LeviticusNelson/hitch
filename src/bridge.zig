@@ -105,11 +105,10 @@ pub const Bridge = struct {
                 return error.UnknownToolId;
             };
             try self.applyContinuation(arena, live_ptr, parsed);
-            if (self.persist_path.len > 0) persist.removeSession(self.io, self.persist_path, live_ptr.session_id, arena);
             if (restored) {
                 const send_json_tmp = try std.fmt.allocPrint(arena,
-                    "{{\"agentId\":{f},\"message\":{{\"text\":\"\"}},\"options\":{{\"enableDeltas\":true,\"local\":{{\"force\":true}}}}}}",
-                    .{std.json.fmt(live_ptr.agent_id, .{})},
+                    "{{\"agentId\":{f},\"message\":{{\"text\":\"\"}},\"options\":{{\"enableDeltas\":true{s}}}}}",
+                    .{ std.json.fmt(live_ptr.agent_id, .{}), try sendLocalSuffix(arena, parsed.tools, true) },
                 );
                 live_ptr.send_json = try self.gpa.dupe(u8, send_json_tmp);
                 self.group.concurrent(self.io, sendLoop, .{live_ptr}) catch self.group.async(self.io, sendLoop, .{live_ptr});
@@ -129,8 +128,8 @@ pub const Bridge = struct {
         const prompt = clip(raw_prompt, models.sdkPromptMaxCharsForModel(parsed.upstream_model));
         const images_json = try imagesJson(arena, parsed.images);
         const send_json_tmp = try std.fmt.allocPrint(arena,
-            "{{\"agentId\":{f},\"message\":{{\"text\":{f}{s}}},\"options\":{{\"enableDeltas\":true}}}}",
-            .{ std.json.fmt(agent_id, .{}), std.json.fmt(prompt, .{}), images_json },
+            "{{\"agentId\":{f},\"message\":{{\"text\":{f}{s}}},\"options\":{{\"enableDeltas\":true{s}}}}}",
+            .{ std.json.fmt(agent_id, .{}), std.json.fmt(prompt, .{}), images_json, try sendLocalSuffix(arena, parsed.tools, false) },
         );
         const live = try self.gpa.create(Live);
         live.* = .{
@@ -153,6 +152,11 @@ pub const Bridge = struct {
     }
 
     pub fn forgetSession(self: *Bridge, session_id: []const u8) void {
+        if (self.persist_path.len > 0) {
+            var scratch = std.heap.ArenaAllocator.init(self.gpa);
+            persist.removeSession(self.io, self.persist_path, session_id, scratch.allocator());
+            scratch.deinit();
+        }
         self.mu.lockUncancelable(self.io);
         const agent = self.agents.get(session_id);
         _ = self.agents.remove(session_id);
@@ -201,7 +205,7 @@ pub const Bridge = struct {
         }
     }
 
-    fn liveForContinuation(self: *Bridge, session_id: []const u8, continuation: []const protocol.ToolResult) ?*Live {
+    pub fn liveForContinuation(self: *Bridge, session_id: []const u8, continuation: []const protocol.ToolResult) ?*Live {
         if (self.getLive(session_id)) |live| return live;
         for (continuation) |c| {
             const w = self.hub.get(c.call_id) orelse continue;
@@ -261,6 +265,9 @@ pub const Bridge = struct {
                 self.last_err = try std.fmt.allocPrint(arena, "unknown tool_use_id: {s}", .{c.call_id});
                 return error.UnknownToolId;
             }
+            if (self.hub.get(c.call_id)) |w| {
+                if (w.from_restore) self.hub.forget(w);
+            }
         }
     }
 
@@ -282,10 +289,15 @@ pub const Bridge = struct {
         var stable_ticks: u32 = 0;
         var late_ticks: u32 = 0;
         var logged_tools = false;
+        var last_progress = nowMs(self.io);
+        var last_chars: usize = 0;
         while (true) {
             if (live.failed) return error.BridgeRpcFailed;
             const finished = live.finished or live.batchReady();
             const n = self.hub.unresolvedCount(live.agent_id);
+            live.mu.lockUncancelable(self.io);
+            const chars = live.text.items.len + live.thinking.items.len;
+            live.mu.unlock(self.io);
             if (n > 0 and !logged_tools) {
                 std.log.info("waitBoundary tools n={d} finished={d} agent={s}", .{
                     n,
@@ -298,12 +310,22 @@ pub const Bridge = struct {
                 last_n = n;
                 stable_ticks = 0;
                 late_ticks = 0;
+                last_progress = nowMs(self.io);
+            } else if (chars != last_chars) {
+                last_chars = chars;
+                last_progress = nowMs(self.io);
             } else if (n > 0) {
                 stable_ticks += 1;
             } else if (finished) {
                 late_ticks += 1;
             }
             if (protocol.waitBoundaryDone(n, finished, stable_ticks, late_ticks)) break;
+            // n>0: Grok still answering tools (ask_user_question). Do not time out.
+            // n==0 and Cursor never sends a delta after resume: first-event 45s.
+            if (protocol.waitBoundaryIdleTimedOut(n, finished, nowMs(self.io) - last_progress, 45_000)) {
+                std.log.warn("waitBoundary idle timeout agent={s} chars={d}", .{ live.agent_id, chars });
+                break;
+            }
             sleepMs(self.io, if (n > 0 or finished) 20 else 5);
         }
         const snaps = try self.hub.snapshotUnresolved(arena, live.agent_id);
@@ -417,7 +439,7 @@ pub const Bridge = struct {
         return self.unary(arena, "/sdk.v1.SdkAgentService/CreateAgent", create);
     }
 
-    fn restorePending(self: *Bridge, arena: std.mem.Allocator, parsed: protocol.Parsed, session_id: []const u8) !?*Live {
+    pub fn restorePending(self: *Bridge, arena: std.mem.Allocator, parsed: protocol.Parsed, session_id: []const u8) !?*Live {
         if (self.persist_path.len == 0) return null;
         const recs = persist.loadAll(self.io, self.persist_path, arena) catch return null;
         var match: ?persist.Record = null;
@@ -437,12 +459,13 @@ pub const Bridge = struct {
         }
         const rec = match orelse return null;
         for (rec.tools) |t| {
-            _ = self.hub.announce(.{
+            const w = self.hub.announce(.{
                 .tool_name = t.name,
                 .tool_call_id = t.call_id,
                 .agent_id = rec.agent_id,
                 .args_json = t.args,
             }) catch continue;
+            w.from_restore = true;
         }
         const live = try self.gpa.create(Live);
         live.* = .{
@@ -608,19 +631,39 @@ fn effortJson(arena: std.mem.Allocator, effort: ?[]const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, ",\"params\":[{{\"id\":\"effort\",\"value\":{f}}}]", .{std.json.fmt(e, .{})});
 }
 
-fn customToolsJson(arena: std.mem.Allocator, tools: []const protocol.Tool) ![]const u8 {
+fn customToolsObject(arena: std.mem.Allocator, tools: []const protocol.Tool) ![]const u8 {
     if (tools.len == 0) return "";
     var out = std.ArrayList(u8).empty;
-    try out.appendSlice(arena, ",\"customTools\":{");
+    try out.append(arena, '{');
     for (tools, 0..) |tool, i| {
         if (i > 0) try out.append(arena, ',');
+        const schema = if (tool.schema_json.len > 0) tool.schema_json else "{\"type\":\"object\",\"properties\":{}}";
         try out.appendSlice(arena, try std.fmt.allocPrint(arena,
             "{f}:{{\"description\":{f},\"inputSchema\":{s}}}",
-            .{ std.json.fmt(tool.sdk_name, .{}), std.json.fmt(tool.description, .{}), tool.schema_json },
+            .{ std.json.fmt(tool.sdk_name, .{}), std.json.fmt(tool.description, .{}), schema },
         ));
     }
     try out.append(arena, '}');
     return out.toOwnedSlice(arena);
+}
+
+fn customToolsJson(arena: std.mem.Allocator, tools: []const protocol.Tool) ![]const u8 {
+    const obj = try customToolsObject(arena, tools);
+    if (obj.len == 0) return "";
+    return std.fmt.allocPrint(arena, ",\"customTools\":{s}", .{obj});
+}
+
+/// Node gold passes local.customTools on every Agent.send, not only CreateAgent.
+/// Without it, follow-up turns (e.g. /learn curation) lose Grok tool schemas and
+/// the model invents args or Cursor-native tools (GetDynamicTools).
+fn sendLocalSuffix(arena: std.mem.Allocator, tools: []const protocol.Tool, force: bool) ![]const u8 {
+    const obj = try customToolsObject(arena, tools);
+    if (!force and obj.len == 0) return "";
+    if (force and obj.len == 0) return ",\"local\":{\"force\":true}";
+    if (force) {
+        return std.fmt.allocPrint(arena, ",\"local\":{{\"force\":true,\"customTools\":{s}}}", .{obj});
+    }
+    return std.fmt.allocPrint(arena, ",\"local\":{{\"customTools\":{s}}}", .{obj});
 }
 
 fn frame(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
@@ -708,6 +751,10 @@ fn appendLive(live: *Live, kind: LiveKind, piece: []const u8) void {
         .text => if (sink.on_text) |fn_ptr| fn_ptr(sink.ctx, piece),
         .thinking => if (sink.on_thinking) |fn_ptr| fn_ptr(sink.ctx, piece),
     }
+}
+
+fn nowMs(io: Io) i64 {
+    return @intCast(@divTrunc(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
 }
 
 fn sleepMs(io: Io, ms: i64) void {
@@ -875,4 +922,23 @@ test "connect frame round-trip length" {
     defer std.testing.allocator.free(framed);
     try std.testing.expectEqual(@as(u8, 0), framed[0]);
     try std.testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, framed[1..5], .big));
+}
+
+test "sendLocalSuffix keeps Grok required fields on every Send" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const tools = [_]protocol.Tool{.{
+        .name = "run_terminal_command",
+        .sdk_name = "run_terminal_command",
+        .description = "Run a bash command",
+        .schema_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"command\",\"description\"]}",
+    }};
+    const suffix = try sendLocalSuffix(arena.allocator(), &tools, false);
+    try std.testing.expect(std.mem.indexOf(u8, suffix, "\"customTools\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, suffix, "\"required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, suffix, "description") != null);
+    const forced = try sendLocalSuffix(arena.allocator(), &tools, true);
+    try std.testing.expect(std.mem.indexOf(u8, forced, "\"force\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forced, "\"customTools\"") != null);
+    try std.testing.expectEqualStrings("", try sendLocalSuffix(arena.allocator(), &.{}, false));
 }

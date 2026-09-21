@@ -85,6 +85,8 @@ fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
             inference_mode,
             shutting,
             app.active_runs.load(.seq_cst),
+            app.config.max_active_runs,
+            app.config.max_runs_per_key,
             app.config.auth_mode == .managed,
         );
         return sendJson(reply, .ok, body, request_id, null);
@@ -161,7 +163,7 @@ fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
         std.log.warn("no route for {s} {s}", .{ @tagName(method), path });
         return sendErr(reply, errors.notFound("No route"), request_id, path, isOpenAi(path));
     };
-    const p = switch (parsed) {
+    var p = switch (parsed) {
         .ok => |v| v,
         .err => |e| return sendErr(reply, e, request_id, path, isOpenAi(path)),
     };
@@ -180,10 +182,13 @@ fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
             return sendJson(reply, .ok, cached, request_id, session_hint);
         }
     }
-    if (beginRun(app, cred.cursor_api_key)) |err| {
-        return sendErr(reply, err, request_id, path, isOpenAi(path));
+    const need_slot = occupiesRunSlot(path, p);
+    if (need_slot) {
+        if (waitBeginRun(app, cred.cursor_api_key)) |err| {
+            return sendErr(reply, err, request_id, path, isOpenAi(path));
+        }
     }
-    defer endRun(app, cred.cursor_api_key);
+    defer if (need_slot) endRun(app, cred.cursor_api_key);
 
     if (isCompactPath(path) or p.compaction_trigger) {
         const compact_id = try ids.compactId(app.io, arena);
@@ -237,13 +242,26 @@ fn serve(app: *App, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
     }
 
     if (p.continuation.len > 0) {
+        if (br.liveForContinuation(sid, p.continuation) == null) {
+            _ = br.restorePending(arena, p, sid) catch null;
+        }
         br.preflightContinuation(arena, p, sid) catch |err| {
-            const msg = if (br.last_err.len > 0) br.last_err else @errorName(err);
-            const gw = switch (err) {
-                error.UnknownToolId, error.MissingToolResult => errors.invalidRequest(msg),
-                else => return err,
-            };
-            return sendErr(reply, gw, request_id, path, isOpenAi(path));
+            const recoverable = (err == error.UnknownToolId or err == error.MissingToolResult) and
+                protocol.canRecoverUnknownContinuation(p);
+            if (!recoverable) {
+                const msg = if (br.last_err.len > 0) br.last_err else @errorName(err);
+                const gw = switch (err) {
+                    error.UnknownToolId, error.MissingToolResult => errors.invalidRequest(msg),
+                    else => return err,
+                };
+                return sendErr(reply, gw, request_id, path, isOpenAi(path));
+            }
+            std.log.warn("continuation lost ({s}); recovering as new turn outputs={d} trailing={d}", .{
+                if (br.last_err.len > 0) br.last_err else @errorName(err),
+                p.all_outputs.len,
+                p.continuation.len,
+            });
+            p.continuation = &.{};
         };
     }
 
@@ -718,33 +736,97 @@ fn unixNow(io: Io) i64 {
     return @intCast(@divTrunc(Io.Clock.real.now(io).nanoseconds, 1_000_000_000));
 }
 
+fn nowMs(io: Io) i64 {
+    return @intCast(@divTrunc(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
+}
+
+fn sleepMs(io: Io, ms: i64) void {
+    const d: Io.Clock.Duration = .{ .raw = .fromMilliseconds(ms), .clock = .real };
+    d.sleep(io) catch {};
+}
+
+const RequestClass = enum { local, inference };
+
+fn classifyRequest(path: []const u8, p: protocol.Parsed) RequestClass {
+    if (isCompactPath(path) or p.compaction_trigger) return .local;
+    if (grok_summary.isGrokCompactSummaryRequest(p)) return .local;
+    return .inference;
+}
+
+fn occupiesRunSlot(path: []const u8, p: protocol.Parsed) bool {
+    return classifyRequest(path, p) == .inference;
+}
+
+fn waitBeginRun(app: *App, key: []const u8) ?errors.Error {
+    if (app.shutting_down.load(.seq_cst)) {
+        return errors.rateLimited("Gateway is draining; new runs are not accepted");
+    }
+    if (beginRun(app, key) == null) return null;
+    const wait_ms: i64 = app.config.capacity_wait_ms;
+    if (wait_ms == 0) return capacityError(app);
+    std.log.info("waiting for run slot up to {d}ms (global={d}/{d})", .{
+        wait_ms,
+        app.active_runs.load(.seq_cst),
+        app.config.max_active_runs,
+    });
+    const start = nowMs(app.io);
+    const poll: i64 = @max(@as(i64, 1), app.config.capacity_poll_ms);
+    while (nowMs(app.io) - start < wait_ms) {
+        if (app.shutting_down.load(.seq_cst)) {
+            return errors.rateLimited("Gateway is draining; new runs are not accepted");
+        }
+        sleepMs(app.io, poll);
+        if (beginRun(app, key) == null) return null;
+    }
+    return capacityError(app);
+}
+
+fn capacityError(app: *App) errors.Error {
+    if (app.active_runs.load(.seq_cst) >= app.config.max_active_runs) {
+        return errors.rateLimited("global_active_runs limit reached");
+    }
+    return errors.rateLimited("per-credential run limit reached");
+}
+
 fn beginRun(app: *App, key: []const u8) ?errors.Error {
+    app.replay_mu.lockUncancelable(app.io);
+    defer app.replay_mu.unlock(app.io);
     const global = app.active_runs.load(.seq_cst);
     if (global >= app.config.max_active_runs) {
         return errors.rateLimited("global_active_runs limit reached");
     }
-    app.replay_mu.lockUncancelable(app.io);
-    defer app.replay_mu.unlock(app.io);
-    const cur = app.runs_by_key.get(key) orelse 0;
-    if (cur >= app.config.max_runs_per_key) {
-        return errors.rateLimited("per-credential run limit reached");
+    if (app.runs_by_key.getPtr(key)) |n| {
+        if (n.* >= app.config.max_runs_per_key) {
+            return errors.rateLimited("per-credential run limit reached");
+        }
+        n.* += 1;
+        _ = app.active_runs.fetchAdd(1, .seq_cst);
+        return null;
     }
-    const owned = app.gpa.dupe(u8, key) catch key;
-    app.runs_by_key.put(owned, cur + 1) catch {};
+    const owned = app.gpa.dupe(u8, key) catch {
+        return errors.upstreamError("capacity tracking failed");
+    };
+    app.runs_by_key.put(owned, 1) catch {
+        app.gpa.free(owned);
+        return errors.upstreamError("capacity tracking failed");
+    };
     _ = app.active_runs.fetchAdd(1, .seq_cst);
     return null;
 }
 
 fn endRun(app: *App, key: []const u8) void {
-    _ = app.active_runs.fetchSub(1, .seq_cst);
     app.replay_mu.lockUncancelable(app.io);
     defer app.replay_mu.unlock(app.io);
-    if (app.runs_by_key.get(key)) |n| {
-        if (n <= 1) {
-            _ = app.runs_by_key.remove(key);
-        } else {
-            app.runs_by_key.put(key, n - 1) catch {};
-        }
+    if (app.active_runs.load(.seq_cst) > 0) {
+        _ = app.active_runs.fetchSub(1, .seq_cst);
+    }
+    const n = app.runs_by_key.getPtr(key) orelse return;
+    if (n.* > 1) {
+        n.* -= 1;
+        return;
+    }
+    if (app.runs_by_key.fetchRemove(key)) |kv| {
+        app.gpa.free(kv.key);
     }
 }
 
@@ -778,4 +860,36 @@ fn headerSet(req: rawhttp.Incoming, buf: []std.http.Header) auth.HeaderSet {
 
 test "pathOnly strips query" {
     try std.testing.expectEqualStrings("/health", pathOnly("/health?x=1"));
+}
+
+fn testParsed(continuation: []protocol.ToolResult, compact: bool, last_user: []const u8) protocol.Parsed {
+    return .{
+        .kind = .responses,
+        .model = "hitch/grok-4.6",
+        .upstream_model = "grok-4.6",
+        .stream = true,
+        .system_text = "",
+        .last_user_text = last_user,
+        .flatten_text = last_user,
+        .tools = &.{},
+        .continuation = continuation,
+        .all_outputs = &.{},
+        .compaction_trigger = compact,
+        .compaction_token = null,
+        .include_usage = false,
+        .effort = null,
+        .raw = .null,
+    };
+}
+
+test "occupiesRunSlot skips compact and grok summary" {
+    var results = [_]protocol.ToolResult{.{ .call_id = "call_1", .output = "{}" }};
+    try std.testing.expect(!occupiesRunSlot("/v1/responses/compact", testParsed(&.{}, false, "hi")));
+    try std.testing.expect(!occupiesRunSlot("/v1/responses", testParsed(&.{}, true, "hi")));
+    try std.testing.expect(occupiesRunSlot("/v1/responses", testParsed(results[0..], false, "hi")));
+    try std.testing.expect(!occupiesRunSlot(
+        "/v1/responses",
+        testParsed(&.{}, false, "Output the final summary inside a single <summary> faithful, concise summary of the conversation so far"),
+    ));
+    try std.testing.expect(occupiesRunSlot("/v1/responses", testParsed(&.{}, false, "hello")));
 }

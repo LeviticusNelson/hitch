@@ -20,7 +20,11 @@ pub const Config = struct {
     tool_callback_port: u16 = 18771,
     managed_cursor_keys: []const []const u8 = &.{},
     max_active_runs: u32 = 32,
-    max_runs_per_key: u32 = 8,
+    // BYOK/daily-driver traffic shares one Cursor key, so the per-key cap must
+    // not be far below the global cap or Grok 429s itself (subagents, compact).
+    max_runs_per_key: u32 = 32,
+    capacity_wait_ms: u32 = 15_000,
+    capacity_poll_ms: u32 = 200,
 
     pub fn fromEnv(env: *const std.process.Environ.Map, allocator: std.mem.Allocator) !Config {
         var c: Config = .{};
@@ -39,6 +43,8 @@ pub const Config = struct {
         if (env.get("TOOL_CALLBACK_PORT")) |p| c.tool_callback_port = std.fmt.parseInt(u16, p, 10) catch c.tool_callback_port;
         if (env.get("MAX_ACTIVE_RUNS")) |n| c.max_active_runs = std.fmt.parseInt(u32, n, 10) catch c.max_active_runs;
         if (env.get("MAX_RUNS_PER_KEY")) |n| c.max_runs_per_key = std.fmt.parseInt(u32, n, 10) catch c.max_runs_per_key;
+        if (env.get("CAPACITY_WAIT_MS")) |n| c.capacity_wait_ms = std.fmt.parseInt(u32, n, 10) catch c.capacity_wait_ms;
+        if (env.get("CAPACITY_POLL_MS")) |n| c.capacity_poll_ms = std.fmt.parseInt(u32, n, 10) catch c.capacity_poll_ms;
         if (env.get("MANAGED_CURSOR_KEYS")) |raw| {
             c.managed_cursor_keys = try splitComma(allocator, raw);
         } else if (c.managed_cursor_key) |one| {

@@ -69,18 +69,29 @@ pub fn decodeRecord(allocator: std.mem.Allocator, line: []const u8) !Record {
     };
 }
 
+const max_pending_records: usize = 32;
+
 pub fn upsertFile(io: Io, path: []const u8, rec: Record, allocator: std.mem.Allocator) !void {
     const existing = readAll(io, allocator, path) catch &.{};
-    var kept = std.ArrayList(u8).empty;
+    var lines = std.ArrayList([]const u8).empty;
     var it = std.mem.splitScalar(u8, existing, '\n');
     while (it.next()) |line| {
         if (std.mem.trim(u8, line, " \t\r\n").len == 0) continue;
         const other = decodeRecord(allocator, line) catch continue;
         if (std.mem.eql(u8, other.session_id, rec.session_id)) continue;
+        try lines.append(allocator, line);
+    }
+    const encoded = try encodeRecord(allocator, rec);
+    try lines.append(allocator, std.mem.trim(u8, encoded, "\n"));
+    const start: usize = if (lines.items.len > max_pending_records)
+        lines.items.len - max_pending_records
+    else
+        0;
+    var kept = std.ArrayList(u8).empty;
+    for (lines.items[start..]) |line| {
         try kept.appendSlice(allocator, line);
         try kept.append(allocator, '\n');
     }
-    try kept.appendSlice(allocator, try encodeRecord(allocator, rec));
     try writeAll(io, path, kept.items);
 }
 

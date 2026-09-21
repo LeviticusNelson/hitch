@@ -432,6 +432,14 @@ pub fn continuationRequiredIds(published: []const []const u8, unresolved: []cons
     return if (published.len > 0) published else unresolved;
 }
 
+/// Orphan function_call_output (smoke / fail-closed) has no extra transcript.
+/// A Grok retry after hitch restart still has historical outputs or a user turn;
+/// Node gold recoverFromTranscript instead of 422 unknown tool_use_id.
+pub fn canRecoverUnknownContinuation(p: Parsed) bool {
+    if (p.last_user_text.len > 0) return true;
+    return p.all_outputs.len > p.continuation.len;
+}
+
 /// When to leave waitBoundary.
 /// - tools in flight: settle ~160ms, or ~40ms after the bridge stream has ended
 /// - no tools, stream ended: wait ~160ms for a late CallCustomTool, then end_turn
@@ -442,6 +450,13 @@ pub fn waitBoundaryDone(n: usize, finished: bool, stable_ticks: u32, late_ticks:
         return stable_ticks >= 8;
     }
     return finished and late_ticks >= 8;
+}
+
+/// Cursor Send after a tool resume can sit with no waiters and no end event.
+/// Tools in flight (n > 0) wait for Grok. Finished streams use waitBoundaryDone.
+pub fn waitBoundaryIdleTimedOut(n: usize, finished: bool, idle_ms: i64, limit_ms: i64) bool {
+    if (n > 0 or finished) return false;
+    return idle_ms > limit_ms;
 }
 
 const UserContentScan = struct {
@@ -826,10 +841,10 @@ test "responses accepts string input and strips prefix" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(),
-        \\{"model":"cursor-cidr/grok-4.6","input":"hello","stream":true}
+        \\{"model":"hitch/grok-4.6","input":"hello","stream":true}
     , .{});
     const out = parseResponses(arena.allocator(), parsed.value);
-    try std.testing.expectEqualStrings("cursor-cidr/grok-4.6", out.ok.model);
+    try std.testing.expectEqualStrings("hitch/grok-4.6", out.ok.model);
     try std.testing.expectEqualStrings("grok-4.6", out.ok.upstream_model);
     try std.testing.expectEqualStrings("hello", out.ok.last_user_text);
     try std.testing.expect(out.ok.stream);
@@ -910,6 +925,13 @@ test "waitBoundaryDone flushes tools after reasoning and waits for a late CallCu
     try std.testing.expect(waitBoundaryDone(2, true, 2, 0));
 }
 
+test "waitBoundaryIdleTimedOut only when Cursor sends nothing" {
+    try std.testing.expect(!waitBoundaryIdleTimedOut(1, false, 60_000, 45_000));
+    try std.testing.expect(!waitBoundaryIdleTimedOut(0, true, 60_000, 45_000));
+    try std.testing.expect(!waitBoundaryIdleTimedOut(0, false, 45_000, 45_000));
+    try std.testing.expect(waitBoundaryIdleTimedOut(0, false, 45_001, 45_000));
+}
+
 test "continuationRequiredIds uses published batch over later hub waiters" {
     const published = [_][]const u8{ "a", "b" };
     const unresolved = [_][]const u8{ "a", "b", "late" };
@@ -920,6 +942,41 @@ test "continuationRequiredIds uses published batch over later hub waiters" {
     const empty: []const []const u8 = &.{};
     const fallback = continuationRequiredIds(empty, &unresolved);
     try std.testing.expectEqual(@as(usize, 3), fallback.len);
+}
+
+test "canRecoverUnknownContinuation needs history beyond the live batch" {
+    var one = [_]ToolResult{.{ .call_id = "x", .output = "nope" }};
+    const orphan = testParsed(one[0..], one[0..], "");
+    try std.testing.expect(!canRecoverUnknownContinuation(orphan));
+    var live = [_]ToolResult{.{ .call_id = "new", .output = "b" }};
+    var hist = [_]ToolResult{
+        .{ .call_id = "old", .output = "a" },
+        .{ .call_id = "new", .output = "b" },
+    };
+    const history = testParsed(live[0..], hist[0..], "");
+    try std.testing.expect(canRecoverUnknownContinuation(history));
+    const follow_up = testParsed(one[0..], one[0..], "next question");
+    try std.testing.expect(canRecoverUnknownContinuation(follow_up));
+}
+
+fn testParsed(continuation: []ToolResult, all_outputs: []ToolResult, last_user: []const u8) Parsed {
+    return .{
+        .kind = .responses,
+        .model = "x",
+        .upstream_model = "x",
+        .stream = true,
+        .system_text = "",
+        .last_user_text = last_user,
+        .flatten_text = last_user,
+        .tools = &.{},
+        .continuation = continuation,
+        .all_outputs = all_outputs,
+        .compaction_trigger = false,
+        .compaction_token = null,
+        .include_usage = false,
+        .effort = null,
+        .raw = .null,
+    };
 }
 
 test "selectPendingResults ignores historical outputs that are not pending" {

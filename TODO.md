@@ -77,7 +77,7 @@ Last reviewed: 2026-09-19 (pending jsonl, lineage hash, managed pool, run caps).
 |---|---|---|
 | `x-cursor-session-id` completed follow-up (`Agent.resume`) E2E | done | Reuse agent; Send last user turn only |
 | Ordinary next turn without session header | done | `digest.stripLastUserBlock` + lineage map; lookup prefix, store full flatten |
-| Pending-tool restart after gateway kill | done | `state_dir/pending.jsonl`; restore waiters; Send `local.force=true` |
+| Pending-tool restart after gateway kill | done | Restore from `pending.jsonl` **before** HTTP preflight; unknown ids with extra transcript recover as a new turn (Grok retry after restart). Persist stays until `waitBoundary` rewrite |
 | Duplicate-same request digest replay | done | SHA-256 of body, non-stream |
 | Persist lineage across process restart | partial | Lineage is in-memory; pending tools jsonl survives kill |
 
@@ -107,6 +107,8 @@ Last reviewed: 2026-09-19 (pending jsonl, lineage hash, managed pool, run caps).
 |---|---|---|
 | `tool_choice` / `parallel_tool_calls=false` / `disable_parallel_tool_use` | done | Parsed; `none` is 422 |
 | Custom / freeform tools → `custom_tool_call` SSE | done | Emit path |
+| `local.customTools` on every Send | done | Node gold; required for /learn follow-up (`ask_user_question`, `run_terminal_command` required fields). CreateAgent-only left Cursor without Grok schemas |
+| waitBoundary idle timeout | done | 45s with no tools and no Cursor delta after resume; hung empty `local.force` Send left Grok `waiting_for_model` |
 | `additional_tools` + Lite dedupe | done | Namespace + duplicate sdk_name drop |
 | `reasoning_effort` / `cursor_model_params` bound; 409 on change | done | Bound per session on CreateAgent |
 
@@ -137,7 +139,7 @@ Last reviewed: 2026-09-19 (pending jsonl, lineage hash, managed pool, run caps).
 |---|---|---|
 | Structured logs without secrets | partial | Health not logged; keys not printed |
 | Graceful shutdown (`shutting_down`) | partial | Health field + `active_runs`; stop.sh SIGTERM |
-| Active-run / per-credential limits | done | `MAX_ACTIVE_RUNS` (32) and `MAX_RUNS_PER_KEY` (8); 429 when hit |
+| Active-run / per-credential limits | done | `MAX_ACTIVE_RUNS`/`MAX_RUNS_PER_KEY` default 32; wait `CAPACITY_WAIT_MS`; compact + tool continuation do not occupy a slot |
 | Health: `transcript_tool_recovery`, `stale_auth_recovery`, `managed_account_failover` | done | Advertised on `/health` |
 
 ### 10. Testing / CI
@@ -181,7 +183,7 @@ Native Zig Cursor executor remains **skip**: official `cursor-sdk-bridge` is `MH
 ## Smoke / evidence
 
 ```bash
-cd /Users/levi/hitch
+cd hitch
 zig build test
 GROK_GATEWAY=http://127.0.0.1:8080 ./scripts/run-smoke.sh
 ```

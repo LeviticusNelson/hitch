@@ -54,9 +54,41 @@ reap_orphan_bridges() {
 }
 reap_orphan_bridges
 
-if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-  echo "hitch already running pid=$(cat "$PID_FILE")"
-  exit 0
+pid_alive() {
+  local p="${1:-}"
+  [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null
+}
+
+healthy() {
+  curl -fsS -m 1 http://127.0.0.1:8080/health 2>/dev/null | python3 -c 'import sys,json; h=json.load(sys.stdin); sys.exit(0 if h.get("status")=="ok" and (h.get("cursor") or {}).get("inference")=="sdk-bridge" else 1)' 2>/dev/null
+}
+
+if [[ -f "$PID_FILE" ]]; then
+  old="$(tr -d ' \t\r\n' <"$PID_FILE" 2>/dev/null || true)"
+  if pid_alive "$old"; then
+    if healthy; then
+      echo "hitch already running pid=$old"
+      exit 0
+    fi
+    echo "waiting for hitch pid=$old to become healthy"
+    for _ in $(seq 1 40); do
+      if healthy; then
+        echo "hitch already running pid=$old"
+        exit 0
+      fi
+      pid_alive "$old" || break
+      sleep 0.25
+    done
+    if pid_alive "$old"; then
+      echo "replacing unhealthy hitch pid=$old"
+      kill "$old" 2>/dev/null || true
+      sleep 0.2
+      kill -9 "$old" 2>/dev/null || true
+    fi
+  else
+    echo "stale pid file pid=$old"
+  fi
+  rm -f "$PID_FILE"
 fi
 if lsof -nP -iTCP:8080 -sTCP:LISTEN >/dev/null 2>&1; then
   listen_pid=$(lsof -nP -t -iTCP:8080 -sTCP:LISTEN | head -1)
@@ -68,6 +100,10 @@ if lsof -nP -iTCP:8080 -sTCP:LISTEN >/dev/null 2>&1; then
   fi
   echo "port 8080 already in use by $cmd pid=$listen_pid" >&2
   exit 1
+fi
+# Crash leftovers: empty mkdir lock with a dead pid must not block Grok SessionStart.
+if [[ -d "$LOCK_DIR" ]]; then
+  rmdir "$LOCK_DIR" 2>/dev/null || rm -rf "$LOCK_DIR"
 fi
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   echo "hitch already running (lock $LOCK_DIR)" >&2
