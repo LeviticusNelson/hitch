@@ -745,11 +745,11 @@ fn sleepMs(io: Io, ms: i64) void {
     d.sleep(io) catch {};
 }
 
-/// Node gold counts creating/running/resuming only. Local compact, Grok
-/// compact-summary intercept, and awaiting tool_result continuation do not.
+/// Node gold counts creating/running/resuming. Local compact and Grok
+/// compact-summary intercept do not. The HTTP tool-result POST is a resume
+/// and must occupy a slot so a hung Send is visible on /health.
 fn occupiesRunSlot(path: []const u8, p: protocol.Parsed) bool {
     if (isCompactPath(path) or p.compaction_trigger) return false;
-    if (p.continuation.len > 0) return false;
     if (grok_summary.isGrokCompactSummaryRequest(p)) return false;
     return true;
 }
@@ -879,11 +879,11 @@ fn testParsed(continuation: []protocol.ToolResult, compact: bool, last_user: []c
     };
 }
 
-test "occupiesRunSlot skips compact, continuation, grok summary" {
+test "occupiesRunSlot skips compact and grok summary" {
     var results = [_]protocol.ToolResult{.{ .call_id = "call_1", .output = "{}" }};
     try std.testing.expect(!occupiesRunSlot("/v1/responses/compact", testParsed(&.{}, false, "hi")));
     try std.testing.expect(!occupiesRunSlot("/v1/responses", testParsed(&.{}, true, "hi")));
-    try std.testing.expect(!occupiesRunSlot("/v1/responses", testParsed(results[0..], false, "hi")));
+    try std.testing.expect(occupiesRunSlot("/v1/responses", testParsed(results[0..], false, "hi")));
     try std.testing.expect(!occupiesRunSlot(
         "/v1/responses",
         testParsed(&.{}, false, "Output the final summary inside a single <summary> faithful, concise summary of the conversation so far"),

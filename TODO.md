@@ -108,6 +108,7 @@ Last reviewed: 2026-09-19 (pending jsonl, lineage hash, managed pool, run caps).
 | `tool_choice` / `parallel_tool_calls=false` / `disable_parallel_tool_use` | done | Parsed; `none` is 422 |
 | Custom / freeform tools → `custom_tool_call` SSE | done | Emit path |
 | `local.customTools` on every Send | done | Node gold; required for /learn follow-up (`ask_user_question`, `run_terminal_command` required fields). CreateAgent-only left Cursor without Grok schemas |
+| waitBoundary idle timeout | done | 45s with no tools and no Cursor delta after resume; hung empty `local.force` Send left Grok `waiting_for_model` |
 | `additional_tools` + Lite dedupe | done | Namespace + duplicate sdk_name drop |
 | `reasoning_effort` / `cursor_model_params` bound; 409 on change | done | Bound per session on CreateAgent |
 

@@ -281,10 +281,15 @@ pub const Bridge = struct {
         var stable_ticks: u32 = 0;
         var late_ticks: u32 = 0;
         var logged_tools = false;
+        var last_progress = nowMs(self.io);
+        var last_chars: usize = 0;
         while (true) {
             if (live.failed) return error.BridgeRpcFailed;
             const finished = live.finished or live.batchReady();
             const n = self.hub.unresolvedCount(live.agent_id);
+            live.mu.lockUncancelable(self.io);
+            const chars = live.text.items.len + live.thinking.items.len;
+            live.mu.unlock(self.io);
             if (n > 0 and !logged_tools) {
                 std.log.info("waitBoundary tools n={d} finished={d} agent={s}", .{
                     n,
@@ -297,12 +302,29 @@ pub const Bridge = struct {
                 last_n = n;
                 stable_ticks = 0;
                 late_ticks = 0;
+                last_progress = nowMs(self.io);
+            } else if (chars != last_chars) {
+                last_chars = chars;
+                last_progress = nowMs(self.io);
             } else if (n > 0) {
                 stable_ticks += 1;
             } else if (finished) {
                 late_ticks += 1;
             }
             if (protocol.waitBoundaryDone(n, finished, stable_ticks, late_ticks)) break;
+            // n>0: Grok still answering tools (ask_user_question). Do not time out.
+            // n==0 and Cursor never sends a delta after resume: first-event 45s.
+            if (n == 0 and !finished) {
+                const idle = nowMs(self.io) - last_progress;
+                if (idle > 45_000) {
+                    std.log.warn("waitBoundary idle timeout {d}ms agent={s} chars={d}", .{
+                        idle,
+                        live.agent_id,
+                        chars,
+                    });
+                    break;
+                }
+            }
             sleepMs(self.io, if (n > 0 or finished) 20 else 5);
         }
         const snaps = try self.hub.snapshotUnresolved(arena, live.agent_id);
@@ -727,6 +749,10 @@ fn appendLive(live: *Live, kind: LiveKind, piece: []const u8) void {
         .text => if (sink.on_text) |fn_ptr| fn_ptr(sink.ctx, piece),
         .thinking => if (sink.on_thinking) |fn_ptr| fn_ptr(sink.ctx, piece),
     }
+}
+
+fn nowMs(io: Io) i64 {
+    return @intCast(@divTrunc(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
 }
 
 fn sleepMs(io: Io, ms: i64) void {
