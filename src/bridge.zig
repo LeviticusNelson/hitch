@@ -152,6 +152,11 @@ pub const Bridge = struct {
     }
 
     pub fn forgetSession(self: *Bridge, session_id: []const u8) void {
+        if (self.persist_path.len > 0) {
+            var scratch = std.heap.ArenaAllocator.init(self.gpa);
+            persist.removeSession(self.io, self.persist_path, session_id, scratch.allocator());
+            scratch.deinit();
+        }
         self.mu.lockUncancelable(self.io);
         const agent = self.agents.get(session_id);
         _ = self.agents.remove(session_id);
@@ -260,6 +265,9 @@ pub const Bridge = struct {
                 self.last_err = try std.fmt.allocPrint(arena, "unknown tool_use_id: {s}", .{c.call_id});
                 return error.UnknownToolId;
             }
+            if (self.hub.get(c.call_id)) |w| {
+                if (w.from_restore) self.hub.forget(w);
+            }
         }
     }
 
@@ -314,16 +322,9 @@ pub const Bridge = struct {
             if (protocol.waitBoundaryDone(n, finished, stable_ticks, late_ticks)) break;
             // n>0: Grok still answering tools (ask_user_question). Do not time out.
             // n==0 and Cursor never sends a delta after resume: first-event 45s.
-            if (n == 0 and !finished) {
-                const idle = nowMs(self.io) - last_progress;
-                if (idle > 45_000) {
-                    std.log.warn("waitBoundary idle timeout {d}ms agent={s} chars={d}", .{
-                        idle,
-                        live.agent_id,
-                        chars,
-                    });
-                    break;
-                }
+            if (protocol.waitBoundaryIdleTimedOut(n, finished, nowMs(self.io) - last_progress, 45_000)) {
+                std.log.warn("waitBoundary idle timeout agent={s} chars={d}", .{ live.agent_id, chars });
+                break;
             }
             sleepMs(self.io, if (n > 0 or finished) 20 else 5);
         }
@@ -458,12 +459,13 @@ pub const Bridge = struct {
         }
         const rec = match orelse return null;
         for (rec.tools) |t| {
-            _ = self.hub.announce(.{
+            const w = self.hub.announce(.{
                 .tool_name = t.name,
                 .tool_call_id = t.call_id,
                 .agent_id = rec.agent_id,
                 .args_json = t.args,
             }) catch continue;
+            w.from_restore = true;
         }
         const live = try self.gpa.create(Live);
         live.* = .{

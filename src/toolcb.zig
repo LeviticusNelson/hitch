@@ -13,6 +13,7 @@ pub const Waiter = struct {
     agent_id: []u8,
     result: ?[]u8 = null,
     done: bool = false,
+    from_restore: bool = false,
     mu: Io.Mutex = .init,
     cond: Io.Condition = .init,
 };

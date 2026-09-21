@@ -70,10 +70,21 @@ if [[ -f "$PID_FILE" ]]; then
       echo "hitch already running pid=$old"
       exit 0
     fi
-    echo "replacing unhealthy hitch pid=$old"
-    kill "$old" 2>/dev/null || true
-    sleep 0.2
-    kill -9 "$old" 2>/dev/null || true
+    echo "waiting for hitch pid=$old to become healthy"
+    for _ in $(seq 1 40); do
+      if healthy; then
+        echo "hitch already running pid=$old"
+        exit 0
+      fi
+      pid_alive "$old" || break
+      sleep 0.25
+    done
+    if pid_alive "$old"; then
+      echo "replacing unhealthy hitch pid=$old"
+      kill "$old" 2>/dev/null || true
+      sleep 0.2
+      kill -9 "$old" 2>/dev/null || true
+    fi
   else
     echo "stale pid file pid=$old"
   fi

@@ -745,13 +745,16 @@ fn sleepMs(io: Io, ms: i64) void {
     d.sleep(io) catch {};
 }
 
-/// Node gold counts creating/running/resuming. Local compact and Grok
-/// compact-summary intercept do not. The HTTP tool-result POST is a resume
-/// and must occupy a slot so a hung Send is visible on /health.
+const RequestClass = enum { local, inference };
+
+fn classifyRequest(path: []const u8, p: protocol.Parsed) RequestClass {
+    if (isCompactPath(path) or p.compaction_trigger) return .local;
+    if (grok_summary.isGrokCompactSummaryRequest(p)) return .local;
+    return .inference;
+}
+
 fn occupiesRunSlot(path: []const u8, p: protocol.Parsed) bool {
-    if (isCompactPath(path) or p.compaction_trigger) return false;
-    if (grok_summary.isGrokCompactSummaryRequest(p)) return false;
-    return true;
+    return classifyRequest(path, p) == .inference;
 }
 
 fn waitBeginRun(app: *App, key: []const u8) ?errors.Error {

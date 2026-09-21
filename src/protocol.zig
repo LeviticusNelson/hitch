@@ -452,6 +452,13 @@ pub fn waitBoundaryDone(n: usize, finished: bool, stable_ticks: u32, late_ticks:
     return finished and late_ticks >= 8;
 }
 
+/// Cursor Send after a tool resume can sit with no waiters and no end event.
+/// Tools in flight (n > 0) wait for Grok. Finished streams use waitBoundaryDone.
+pub fn waitBoundaryIdleTimedOut(n: usize, finished: bool, idle_ms: i64, limit_ms: i64) bool {
+    if (n > 0 or finished) return false;
+    return idle_ms > limit_ms;
+}
+
 const UserContentScan = struct {
     results: []ToolResult,
     has_text: bool,
@@ -916,6 +923,13 @@ test "waitBoundaryDone flushes tools after reasoning and waits for a late CallCu
     try std.testing.expect(waitBoundaryDone(1, false, 8, 0));
     try std.testing.expect(!waitBoundaryDone(2, true, 1, 0));
     try std.testing.expect(waitBoundaryDone(2, true, 2, 0));
+}
+
+test "waitBoundaryIdleTimedOut only when Cursor sends nothing" {
+    try std.testing.expect(!waitBoundaryIdleTimedOut(1, false, 60_000, 45_000));
+    try std.testing.expect(!waitBoundaryIdleTimedOut(0, true, 60_000, 45_000));
+    try std.testing.expect(!waitBoundaryIdleTimedOut(0, false, 45_000, 45_000));
+    try std.testing.expect(waitBoundaryIdleTimedOut(0, false, 45_001, 45_000));
 }
 
 test "continuationRequiredIds uses published batch over later hub waiters" {
