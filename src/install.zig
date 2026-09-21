@@ -39,6 +39,22 @@ pub fn run(init: std.process.Init) !void {
     try copyAbs(io, arena, exe, home_bin);
     try chmodExec(home_bin);
 
+    // Plugin hooks load after SessionStart, so opening Grok never runs them.
+    // A user hook in ~/.grok/hooks is always trusted and runs on session start.
+    const hooks_dir = try std.fs.path.join(arena, &.{ home, ".grok", "hooks" });
+    try cwd.createDirPath(io, hooks_dir);
+    const ensure_path = try std.fs.path.join(arena, &.{ plugin, "hooks", "ensure-gateway.sh" });
+    const user_hook = try std.fmt.allocPrint(arena,
+        \\{{
+        \\  "hooks": {{
+        \\    "SessionStart": [{{"hooks": [{{"type": "command", "command": "{s}", "timeout": 45}}]}}],
+        \\    "UserPromptSubmit": [{{"hooks": [{{"type": "command", "command": "{s}", "timeout": 45}}]}}]
+        \\  }}
+        \\}}
+        \\
+    , .{ ensure_path, ensure_path });
+    try write(io, try std.fs.path.join(arena, &.{ hooks_dir, "hitch.json" }), user_hook);
+
     enableInConfig(io, arena, home) catch |err| {
         std.log.warn("could not enable hitch in ~/.grok/config.toml ({t}); run: grok plugin enable hitch", .{err});
     };
