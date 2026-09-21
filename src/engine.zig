@@ -4,7 +4,7 @@ const protocol = @import("protocol.zig");
 
 pub const Fake = struct {
     pub fn listModels(allocator: std.mem.Allocator) ![]const []const u8 {
-        const ids = [_][]const u8{ "grok-4.6", "composer-2", "composer-2.5", "default" };
+        const ids = [_][]const u8{ "grok-4.7", "grok-4.6", "composer-2", "composer-2.5", "default" };
         return allocator.dupe([]const u8, &ids);
     }
 

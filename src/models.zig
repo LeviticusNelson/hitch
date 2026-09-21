@@ -102,5 +102,7 @@ test "catalogModelIdsForClient prefixes only Grok clients" {
 
 test "context window for grok family" {
     try std.testing.expectEqual(@as(u32, 256_000), contextTokensForModel("cursor-cidr/grok-4.6"));
+    try std.testing.expectEqual(@as(u32, 256_000), contextTokensForModel("cursor-cidr/grok-4.7"));
+    try std.testing.expectEqualStrings("grok-4.7", upstreamCursorModelId("cursor-cidr/grok-4.7"));
     try std.testing.expect(sdkPromptMaxCharsForModel("grok-4.6") >= min_compact_chars);
 }
