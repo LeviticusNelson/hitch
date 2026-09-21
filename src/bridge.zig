@@ -107,8 +107,8 @@ pub const Bridge = struct {
             try self.applyContinuation(arena, live_ptr, parsed);
             if (restored) {
                 const send_json_tmp = try std.fmt.allocPrint(arena,
-                    "{{\"agentId\":{f},\"message\":{{\"text\":\"\"}},\"options\":{{\"enableDeltas\":true,\"local\":{{\"force\":true}}}}}}",
-                    .{std.json.fmt(live_ptr.agent_id, .{})},
+                    "{{\"agentId\":{f},\"message\":{{\"text\":\"\"}},\"options\":{{\"enableDeltas\":true{s}}}}}",
+                    .{ std.json.fmt(live_ptr.agent_id, .{}), try sendLocalSuffix(arena, parsed.tools, true) },
                 );
                 live_ptr.send_json = try self.gpa.dupe(u8, send_json_tmp);
                 self.group.concurrent(self.io, sendLoop, .{live_ptr}) catch self.group.async(self.io, sendLoop, .{live_ptr});
@@ -128,8 +128,8 @@ pub const Bridge = struct {
         const prompt = clip(raw_prompt, models.sdkPromptMaxCharsForModel(parsed.upstream_model));
         const images_json = try imagesJson(arena, parsed.images);
         const send_json_tmp = try std.fmt.allocPrint(arena,
-            "{{\"agentId\":{f},\"message\":{{\"text\":{f}{s}}},\"options\":{{\"enableDeltas\":true}}}}",
-            .{ std.json.fmt(agent_id, .{}), std.json.fmt(prompt, .{}), images_json },
+            "{{\"agentId\":{f},\"message\":{{\"text\":{f}{s}}},\"options\":{{\"enableDeltas\":true{s}}}}}",
+            .{ std.json.fmt(agent_id, .{}), std.json.fmt(prompt, .{}), images_json, try sendLocalSuffix(arena, parsed.tools, false) },
         );
         const live = try self.gpa.create(Live);
         live.* = .{
@@ -607,19 +607,39 @@ fn effortJson(arena: std.mem.Allocator, effort: ?[]const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, ",\"params\":[{{\"id\":\"effort\",\"value\":{f}}}]", .{std.json.fmt(e, .{})});
 }
 
-fn customToolsJson(arena: std.mem.Allocator, tools: []const protocol.Tool) ![]const u8 {
+fn customToolsObject(arena: std.mem.Allocator, tools: []const protocol.Tool) ![]const u8 {
     if (tools.len == 0) return "";
     var out = std.ArrayList(u8).empty;
-    try out.appendSlice(arena, ",\"customTools\":{");
+    try out.append(arena, '{');
     for (tools, 0..) |tool, i| {
         if (i > 0) try out.append(arena, ',');
+        const schema = if (tool.schema_json.len > 0) tool.schema_json else "{\"type\":\"object\",\"properties\":{}}";
         try out.appendSlice(arena, try std.fmt.allocPrint(arena,
             "{f}:{{\"description\":{f},\"inputSchema\":{s}}}",
-            .{ std.json.fmt(tool.sdk_name, .{}), std.json.fmt(tool.description, .{}), tool.schema_json },
+            .{ std.json.fmt(tool.sdk_name, .{}), std.json.fmt(tool.description, .{}), schema },
         ));
     }
     try out.append(arena, '}');
     return out.toOwnedSlice(arena);
+}
+
+fn customToolsJson(arena: std.mem.Allocator, tools: []const protocol.Tool) ![]const u8 {
+    const obj = try customToolsObject(arena, tools);
+    if (obj.len == 0) return "";
+    return std.fmt.allocPrint(arena, ",\"customTools\":{s}", .{obj});
+}
+
+/// Node gold passes local.customTools on every Agent.send, not only CreateAgent.
+/// Without it, follow-up turns (e.g. /learn curation) lose Grok tool schemas and
+/// the model invents args or Cursor-native tools (GetDynamicTools).
+fn sendLocalSuffix(arena: std.mem.Allocator, tools: []const protocol.Tool, force: bool) ![]const u8 {
+    const obj = try customToolsObject(arena, tools);
+    if (!force and obj.len == 0) return "";
+    if (force and obj.len == 0) return ",\"local\":{\"force\":true}";
+    if (force) {
+        return std.fmt.allocPrint(arena, ",\"local\":{{\"force\":true,\"customTools\":{s}}}", .{obj});
+    }
+    return std.fmt.allocPrint(arena, ",\"local\":{{\"customTools\":{s}}}", .{obj});
 }
 
 fn frame(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
@@ -874,4 +894,23 @@ test "connect frame round-trip length" {
     defer std.testing.allocator.free(framed);
     try std.testing.expectEqual(@as(u8, 0), framed[0]);
     try std.testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, framed[1..5], .big));
+}
+
+test "sendLocalSuffix keeps Grok required fields on every Send" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const tools = [_]protocol.Tool{.{
+        .name = "run_terminal_command",
+        .sdk_name = "run_terminal_command",
+        .description = "Run a bash command",
+        .schema_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"command\",\"description\"]}",
+    }};
+    const suffix = try sendLocalSuffix(arena.allocator(), &tools, false);
+    try std.testing.expect(std.mem.indexOf(u8, suffix, "\"customTools\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, suffix, "\"required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, suffix, "description") != null);
+    const forced = try sendLocalSuffix(arena.allocator(), &tools, true);
+    try std.testing.expect(std.mem.indexOf(u8, forced, "\"force\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forced, "\"customTools\"") != null);
+    try std.testing.expectEqualStrings("", try sendLocalSuffix(arena.allocator(), &.{}, false));
 }

@@ -107,6 +107,7 @@ Last reviewed: 2026-09-19 (pending jsonl, lineage hash, managed pool, run caps).
 |---|---|---|
 | `tool_choice` / `parallel_tool_calls=false` / `disable_parallel_tool_use` | done | Parsed; `none` is 422 |
 | Custom / freeform tools → `custom_tool_call` SSE | done | Emit path |
+| `local.customTools` on every Send | done | Node gold; required for /learn follow-up (`ask_user_question`, `run_terminal_command` required fields). CreateAgent-only left Cursor without Grok schemas |
 | `additional_tools` + Lite dedupe | done | Namespace + duplicate sdk_name drop |
 | `reasoning_effort` / `cursor_model_params` bound; 409 on change | done | Bound per session on CreateAgent |
 
