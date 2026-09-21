@@ -27,8 +27,10 @@ pub fn stripLastUserBlock(flatten_text: []const u8, last_user_text: []const u8) 
     return prefix;
 }
 
-pub fn lineageKey(system_text: []const u8, prefix: []const u8) [64]u8 {
+pub fn lineageKey(model_id: []const u8, system_text: []const u8, prefix: []const u8) [64]u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(model_id);
+    h.update("\n");
     h.update(system_text);
     h.update("\n");
     h.update(prefix);
@@ -45,9 +47,11 @@ test "sha256Hex is stable" {
 
 test "lineageKey of turn-2 prefix matches turn-1 full flatten" {
     const turn1 = "user: hi";
-    const stored = lineageKey("sys", turn1);
+    const stored = lineageKey("grok-4.7", "sys", turn1);
     const prefix = stripLastUserBlock("user: hi\nuser: next", "next");
     try std.testing.expectEqualStrings("user: hi", prefix);
-    const looked = lineageKey("sys", prefix);
+    const looked = lineageKey("grok-4.7", "sys", prefix);
     try std.testing.expectEqualSlices(u8, stored[0..], looked[0..]);
+    const other = lineageKey("claude-opus-4-8", "sys", prefix);
+    try std.testing.expect(!std.mem.eql(u8, stored[0..], other[0..]));
 }

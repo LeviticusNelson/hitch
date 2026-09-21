@@ -9,6 +9,11 @@ const pool_mod = @import("pool.zig");
 const protocol = @import("protocol.zig");
 const toolcb = @import("toolcb.zig");
 
+const BoundAgent = struct {
+    id: []const u8,
+    model: []const u8,
+};
+
 pub const Sink = struct {
     ctx: *anyopaque = undefined,
     on_text: ?*const fn (*anyopaque, []const u8) void = null,
@@ -24,7 +29,7 @@ pub const Bridge = struct {
     api_key: []const u8,
     workspace: []const u8,
     child: ?std.process.Child = null,
-    agents: std.StringHashMap([]const u8) = undefined,
+    agents: std.StringHashMap(BoundAgent) = undefined,
     efforts: std.StringHashMap([]const u8) = undefined,
     lives: std.StringHashMap(*Live) = undefined,
     lineage: std.StringHashMap([]const u8) = undefined,
@@ -119,9 +124,12 @@ pub const Bridge = struct {
         }
 
         const prefix = digest.stripLastUserBlock(parsed.flatten_text, parsed.last_user_text);
-        const lookup = digest.lineageKey(parsed.system_text, prefix);
+        const sent_effort = models.cursorEffortParam(parsed.upstream_model, parsed.effort) orelse "";
+        const policy = try std.fmt.allocPrint(arena, "{s}\n{s}", .{ parsed.upstream_model, sent_effort });
+        const lookup = digest.lineageKey(policy, parsed.system_text, prefix);
         self.mu.lockUncancelable(self.io);
-        const known = self.agents.get(session_id) != null or self.lineage.get(lookup[0..]) != null;
+        const same_model = if (self.agents.get(session_id)) |bound| std.mem.eql(u8, bound.model, parsed.upstream_model) else false;
+        const known = same_model or self.lineage.get(lookup[0..]) != null;
         self.mu.unlock(self.io);
         const agent_id = try self.ensureAgent(arena, parsed, session_id);
         const raw_prompt = if (known and parsed.last_user_text.len > 0) parsed.last_user_text else parsed.flatten_text;
@@ -161,17 +169,17 @@ pub const Bridge = struct {
         const agent = self.agents.get(session_id);
         _ = self.agents.remove(session_id);
         _ = self.lives.remove(session_id);
-        if (agent) |aid| {
+        if (agent) |bound| {
             var drop = std.ArrayList([]const u8).empty;
             var it = self.lineage.iterator();
             while (it.next()) |e| {
-                if (std.mem.eql(u8, e.value_ptr.*, aid)) drop.append(self.gpa, e.key_ptr.*) catch {};
+                if (std.mem.eql(u8, e.value_ptr.*, bound.id)) drop.append(self.gpa, e.key_ptr.*) catch {};
             }
             for (drop.items) |k| _ = self.lineage.remove(k);
             if (drop.items.len > 0) self.gpa.free(drop.items);
             self.mu.unlock(self.io);
-            self.hub.cancelAgent(aid);
-            std.log.info("forget session={s} agent={s}", .{ session_id, aid });
+            self.hub.cancelAgent(bound.id);
+            std.log.info("forget session={s} agent={s}", .{ session_id, bound.id });
             return;
         }
         self.mu.unlock(self.io);
@@ -362,40 +370,48 @@ pub const Bridge = struct {
     }
 
     fn ensureAgent(self: *Bridge, arena: std.mem.Allocator, parsed: protocol.Parsed, session_id: []const u8) ![]const u8 {
+        const model = parsed.upstream_model;
+        const sent_effort = models.cursorEffortParam(model, parsed.effort) orelse "";
+        const policy = try std.fmt.allocPrint(arena, "{s}\n{s}", .{ model, sent_effort });
         self.mu.lockUncancelable(self.io);
-        if (self.efforts.get(session_id)) |bound| {
-            if (parsed.effort) |want| {
-                if (!std.mem.eql(u8, bound, want)) {
-                    self.mu.unlock(self.io);
-                    self.last_err = "cursor_model_params cannot change on an existing session";
-                    return error.SessionConflict;
-                }
+        if (self.agents.get(session_id)) |bound| {
+            const effort_ok = if (self.efforts.get(session_id)) |prev| sent_effort.len == 0 or std.mem.eql(u8, prev, sent_effort) else true;
+            if (!std.mem.eql(u8, bound.model, model) or !effort_ok) {
+                _ = self.agents.remove(session_id);
+                _ = self.efforts.remove(session_id);
             }
-        } else if (parsed.effort) |want| {
-            const key = self.gpa.dupe(u8, session_id) catch {
-                self.mu.unlock(self.io);
-                return error.OutOfMemory;
-            };
-            const val = self.gpa.dupe(u8, want) catch {
-                self.mu.unlock(self.io);
-                return error.OutOfMemory;
-            };
-            self.efforts.put(key, val) catch {};
         }
         const prefix = digest.stripLastUserBlock(parsed.flatten_text, parsed.last_user_text);
-        const lookup = digest.lineageKey(parsed.system_text, prefix);
+        const lookup = digest.lineageKey(policy, parsed.system_text, prefix);
         if (self.lineage.get(lookup[0..])) |existing| {
             const sid_copy = self.gpa.dupe(u8, session_id) catch {
                 self.mu.unlock(self.io);
                 return error.OutOfMemory;
             };
-            self.agents.put(sid_copy, existing) catch {};
+            const model_copy = self.gpa.dupe(u8, model) catch {
+                self.mu.unlock(self.io);
+                return error.OutOfMemory;
+            };
+            self.agents.put(sid_copy, .{ .id = existing, .model = model_copy }) catch {};
             self.mu.unlock(self.io);
             return existing;
         }
-        if (self.agents.get(session_id)) |id| {
-            self.mu.unlock(self.io);
-            return id;
+        if (self.agents.get(session_id)) |bound| {
+            if (std.mem.eql(u8, bound.model, model)) {
+                self.mu.unlock(self.io);
+                return bound.id;
+            }
+        }
+        if (sent_effort.len > 0) {
+            const key = self.gpa.dupe(u8, session_id) catch {
+                self.mu.unlock(self.io);
+                return error.OutOfMemory;
+            };
+            const val = self.gpa.dupe(u8, sent_effort) catch {
+                self.mu.unlock(self.io);
+                return error.OutOfMemory;
+            };
+            self.efforts.put(key, val) catch {};
         }
         self.mu.unlock(self.io);
         var api_key = self.api_key;
@@ -415,12 +431,14 @@ pub const Bridge = struct {
         const agent_id = jsonx.getStr(created_json.value, "agentId") orelse return error.BridgeCreateFailed;
         const durable = try self.gpa.dupe(u8, agent_id);
         const sid = try self.gpa.dupe(u8, session_id);
-        const store = digest.lineageKey(parsed.system_text, parsed.flatten_text);
+        const store = digest.lineageKey(policy, parsed.system_text, parsed.flatten_text);
         const lin_key = try self.gpa.dupe(u8, store[0..]);
+        const model_owned = try self.gpa.dupe(u8, model);
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
-        try self.agents.put(sid, durable);
+        try self.agents.put(sid, .{ .id = durable, .model = model_owned });
         self.lineage.put(lin_key, durable) catch {};
+        std.log.info("create agent model={s} session={s}", .{ model, session_id });
         return durable;
     }
 
@@ -485,7 +503,8 @@ pub const Bridge = struct {
         const sid = try self.gpa.dupe(u8, rec.session_id);
         const aid = try self.gpa.dupe(u8, rec.agent_id);
         self.mu.lockUncancelable(self.io);
-        self.agents.put(sid, aid) catch {};
+        const model_owned = self.gpa.dupe(u8, rec.model) catch rec.model;
+        self.agents.put(sid, .{ .id = aid, .model = model_owned }) catch {};
         self.lives.put(live.session_id, live) catch {};
         self.mu.unlock(self.io);
         std.log.info("restore pending session={s} agent={s} tools={d}", .{ rec.session_id, rec.agent_id, rec.tools.len });
