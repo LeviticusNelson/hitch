@@ -896,7 +896,7 @@ pub fn spawn(
         .api_key = api_key,
         .workspace = workspace,
         .child = child,
-        .agents = std.StringHashMap([]const u8).init(gpa),
+        .agents = std.StringHashMap(BoundAgent).init(gpa),
         .efforts = std.StringHashMap([]const u8).init(gpa),
         .lives = std.StringHashMap(*Live).init(gpa),
         .lineage = std.StringHashMap([]const u8).init(gpa),
