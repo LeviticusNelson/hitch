@@ -865,7 +865,7 @@ test "pathOnly strips query" {
 fn testParsed(continuation: []protocol.ToolResult, compact: bool, last_user: []const u8) protocol.Parsed {
     return .{
         .kind = .responses,
-        .model = "cursor-cidr/grok-4.6",
+        .model = "hitch/grok-4.6",
         .upstream_model = "grok-4.6",
         .stream = true,
         .system_text = "",

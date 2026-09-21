@@ -43,7 +43,7 @@ Match Node `docs/PROTOCOL_COMPATIBILITY.md`:
 
 Fail closed on the same shapes Node rejects (`previous_response_id`, hosted tools, mixed tool_result, unknown tool ids).
 
-Wire ids: accept `cursor-cidr/grok-4.6` (and siblings), strip prefix before Cursor, echo the prefixed id on HTTP.
+Wire ids: accept `hitch/grok-4.6` (and `cursor-acp/` or `cursor/` siblings), strip the prefix before Cursor, echo the prefixed id on HTTP.
 
 ## Testing against Node
 

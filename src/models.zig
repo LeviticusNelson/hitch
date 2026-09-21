@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const client_model_prefixes = [_][]const u8{ "cursor-cidr/", "cursor-acp/", "cursor/" };
+pub const client_model_prefixes = [_][]const u8{ "hitch/", "cursor-acp/", "cursor/" };
 
 pub const chars_per_token: u32 = 4;
 pub const default_context_tokens: u32 = 128_000;
@@ -79,7 +79,7 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 }
 
 test "upstreamCursorModelId strips Grok wire prefixes" {
-    try std.testing.expectEqualStrings("grok-4.6", upstreamCursorModelId("cursor-cidr/grok-4.6"));
+    try std.testing.expectEqualStrings("grok-4.6", upstreamCursorModelId("hitch/grok-4.6"));
     try std.testing.expectEqualStrings("grok-4.6", upstreamCursorModelId("cursor-acp/grok-4.6"));
     try std.testing.expectEqualStrings("grok-4.6", upstreamCursorModelId("cursor/grok-4.6"));
     try std.testing.expectEqualStrings("grok-4.6", upstreamCursorModelId("grok-4.6"));
@@ -92,7 +92,7 @@ test "catalogModelIdsForClient prefixes only Grok clients" {
         std.testing.allocator.free(grok);
     }
     try std.testing.expectEqual(@as(usize, 3), grok.len);
-    try std.testing.expectEqualStrings("cursor-cidr/grok-4.6", grok[0]);
+    try std.testing.expectEqualStrings("hitch/grok-4.6", grok[0]);
 
     const other = try catalogModelIdsForClient(std.testing.allocator, "grok-4.6", "curl/8");
     defer std.testing.allocator.free(other);
@@ -101,8 +101,8 @@ test "catalogModelIdsForClient prefixes only Grok clients" {
 }
 
 test "context window for grok family" {
-    try std.testing.expectEqual(@as(u32, 256_000), contextTokensForModel("cursor-cidr/grok-4.6"));
-    try std.testing.expectEqual(@as(u32, 256_000), contextTokensForModel("cursor-cidr/grok-4.7"));
-    try std.testing.expectEqualStrings("grok-4.7", upstreamCursorModelId("cursor-cidr/grok-4.7"));
+    try std.testing.expectEqual(@as(u32, 256_000), contextTokensForModel("hitch/grok-4.6"));
+    try std.testing.expectEqual(@as(u32, 256_000), contextTokensForModel("hitch/grok-4.7"));
+    try std.testing.expectEqualStrings("grok-4.7", upstreamCursorModelId("hitch/grok-4.7"));
     try std.testing.expect(sdkPromptMaxCharsForModel("grok-4.6") >= min_compact_chars);
 }

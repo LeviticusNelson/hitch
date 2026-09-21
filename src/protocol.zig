@@ -841,10 +841,10 @@ test "responses accepts string input and strips prefix" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(),
-        \\{"model":"cursor-cidr/grok-4.6","input":"hello","stream":true}
+        \\{"model":"hitch/grok-4.6","input":"hello","stream":true}
     , .{});
     const out = parseResponses(arena.allocator(), parsed.value);
-    try std.testing.expectEqualStrings("cursor-cidr/grok-4.6", out.ok.model);
+    try std.testing.expectEqualStrings("hitch/grok-4.6", out.ok.model);
     try std.testing.expectEqualStrings("grok-4.6", out.ok.upstream_model);
     try std.testing.expectEqualStrings("hello", out.ok.last_user_text);
     try std.testing.expect(out.ok.stream);

@@ -183,7 +183,7 @@ Native Zig Cursor executor remains **skip**: official `cursor-sdk-bridge` is `MH
 ## Smoke / evidence
 
 ```bash
-cd /Users/levi/hitch
+cd hitch
 zig build test
 GROK_GATEWAY=http://127.0.0.1:8080 ./scripts/run-smoke.sh
 ```
