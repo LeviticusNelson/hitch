@@ -35,6 +35,25 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
+# Drop orphan sdk-bridge processes from earlier hitch lives before we spawn a new one.
+reap_orphan_bridges() {
+  local ws="${WORKSPACE_DIR:-$DIR/workspace}"
+  local legacy_ws="$HOME/.cursor-sdk2api-zig/workspace"
+  ps -axo pid=,ppid=,command= | while read -r pid ppid cmd; do
+    [[ "$cmd" == *cursor-sdk-bridge* ]] || continue
+    [[ "$ppid" == "1" ]] || continue
+    case "$cmd" in
+      *"--workspace $ws"*|*"--workspace $legacy_ws"*)
+        kill "$pid" 2>/dev/null || true
+        sleep 0.05
+        kill -9 "$pid" 2>/dev/null || true
+        echo "reaped orphan bridge pid=$pid"
+        ;;
+    esac
+  done
+}
+reap_orphan_bridges
+
 if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
   echo "hitch already running pid=$(cat "$PID_FILE")"
   exit 0

@@ -35,4 +35,24 @@ if lsof -nP -iTCP:8080 -sTCP:LISTEN >/dev/null 2>&1; then
     echo "cleared hitch listen pid=$listen_pid"
   fi
 fi
+# Reap leftover official bridge children (they survive SIGKILL of hitch and leak RAM).
+reap_bridges() {
+  local ws="${HITCH_WORKSPACE:-$DIR/workspace}"
+  local legacy_ws="$HOME/.cursor-sdk2api-zig/workspace"
+  ps -axo pid=,command= | while read -r pid cmd; do
+    case "$cmd" in
+      *cursor-sdk-bridge*)
+        case "$cmd" in
+          *"--workspace $ws"*|*"--workspace $legacy_ws"*)
+            kill "$pid" 2>/dev/null || true
+            sleep 0.05
+            kill -9 "$pid" 2>/dev/null || true
+            echo "reaped bridge pid=$pid"
+            ;;
+        esac
+        ;;
+    esac
+  done
+}
+reap_bridges
 rmdir "$LOCK_DIR" 2>/dev/null || true

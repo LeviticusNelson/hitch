@@ -755,10 +755,11 @@ fn lookupReplay(app: *App, hex: []const u8) ?[]const u8 {
 }
 
 fn storeReplay(app: *App, hex: []const u8, json: []const u8) void {
-    const key = app.gpa.dupe(u8, hex) catch return;
-    const val = app.gpa.dupe(u8, json) catch return;
     app.replay_mu.lockUncancelable(app.io);
     defer app.replay_mu.unlock(app.io);
+    if (app.replay.count() >= 64) return;
+    const key = app.gpa.dupe(u8, hex) catch return;
+    const val = app.gpa.dupe(u8, json) catch return;
     app.replay.put(key, val) catch {};
 }
 
