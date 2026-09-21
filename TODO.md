@@ -137,7 +137,7 @@ Last reviewed: 2026-09-19 (pending jsonl, lineage hash, managed pool, run caps).
 |---|---|---|
 | Structured logs without secrets | partial | Health not logged; keys not printed |
 | Graceful shutdown (`shutting_down`) | partial | Health field + `active_runs`; stop.sh SIGTERM |
-| Active-run / per-credential limits | done | `MAX_ACTIVE_RUNS` (32) and `MAX_RUNS_PER_KEY` (8); 429 when hit |
+| Active-run / per-credential limits | done | `MAX_ACTIVE_RUNS`/`MAX_RUNS_PER_KEY` default 32; wait `CAPACITY_WAIT_MS`; compact + tool continuation do not occupy a slot |
 | Health: `transcript_tool_recovery`, `stale_auth_recovery`, `managed_account_failover` | done | Advertised on `/health` |
 
 ### 10. Testing / CI
