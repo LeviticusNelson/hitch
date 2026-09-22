@@ -1,5 +1,6 @@
 zig-out/
 .zig-cache/
+grok-plugin/bin/
 *.o
 *.a
 .DS_Store
