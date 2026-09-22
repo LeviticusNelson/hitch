@@ -25,12 +25,14 @@ pub const Hub = struct {
     mu: Io.Mutex = .init,
     cond: Io.Condition = .init,
     by_id: std.StringHashMap(*Waiter),
+    spent_agent: std.StringHashMap([]const u8),
 
     pub fn init(io: Io, gpa: std.mem.Allocator) Hub {
         return .{
             .io = io,
             .gpa = gpa,
             .by_id = std.StringHashMap(*Waiter).init(gpa),
+            .spent_agent = std.StringHashMap([]const u8).init(gpa),
         };
     }
 
@@ -65,13 +67,44 @@ pub const Hub = struct {
         return self.by_id.get(call_id);
     }
 
+    pub fn isSpent(self: *Hub, call_id: []const u8) bool {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return self.spent_agent.get(call_id) != null;
+    }
+
+    pub fn spentAgent(self: *Hub, call_id: []const u8) ?[]const u8 {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return self.spent_agent.get(call_id);
+    }
+
+    fn noteSpent(self: *Hub, call_id: []const u8, agent_id: []const u8) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.spent_agent.get(call_id) != null) return;
+        if (self.spent_agent.count() >= 512) return;
+        const id = self.gpa.dupe(u8, call_id) catch return;
+        const agent = self.gpa.dupe(u8, agent_id) catch {
+            self.gpa.free(id);
+            return;
+        };
+        self.spent_agent.put(id, agent) catch {
+            self.gpa.free(id);
+            self.gpa.free(agent);
+        };
+    }
+
     pub fn fulfill(self: *Hub, call_id: []const u8, output: []const u8) bool {
         self.mu.lockUncancelable(self.io);
         const w = self.by_id.get(call_id) orelse {
+            const spent = self.spent_agent.get(call_id) != null;
             self.mu.unlock(self.io);
-            return false;
+            return spent;
         };
+        const agent_id = w.agent_id;
         self.mu.unlock(self.io);
+        self.noteSpent(call_id, agent_id);
         const copy = self.gpa.dupe(u8, output) catch return false;
         w.mu.lockUncancelable(self.io);
         if (!w.done) {

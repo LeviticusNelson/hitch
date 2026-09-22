@@ -410,7 +410,6 @@ fn runBridge(
         const gw = switch (err) {
             error.UnknownToolId, error.MissingToolResult => errors.invalidRequest(msg),
             error.SessionLost => errors.sessionLost(msg),
-            error.SessionConflict => errors.sessionConflict(msg),
             error.BridgeRpcFailed => errors.upstreamError(msg),
             else => return err,
         };

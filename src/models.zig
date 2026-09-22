@@ -9,6 +9,13 @@ pub const default_compact_fill_ratio: f64 = 0.25;
 pub const min_compact_chars: u32 = 48_000;
 pub const max_compact_chars: u32 = 360_000;
 
+/// Cursor grok-4.7 returns an empty assistant message when CreateAgent
+/// includes an effort param. 4.6 still honors effort.
+pub fn cursorEffortParam(model_id: []const u8, effort: ?[]const u8) ?[]const u8 {
+    if (eql(upstreamCursorModelId(model_id), "grok-4.7")) return null;
+    return effort;
+}
+
 pub fn upstreamCursorModelId(model_id: []const u8) []const u8 {
     const id = std.mem.trim(u8, model_id, " \t\r\n");
     for (client_model_prefixes) |prefix| {
@@ -104,5 +111,7 @@ test "context window for grok family" {
     try std.testing.expectEqual(@as(u32, 256_000), contextTokensForModel("hitch/grok-4.6"));
     try std.testing.expectEqual(@as(u32, 256_000), contextTokensForModel("hitch/grok-4.7"));
     try std.testing.expectEqualStrings("grok-4.7", upstreamCursorModelId("hitch/grok-4.7"));
+    try std.testing.expect(cursorEffortParam("hitch/grok-4.7", "high") == null);
+    try std.testing.expectEqualStrings("high", cursorEffortParam("hitch/grok-4.6", "high").?);
     try std.testing.expect(sdkPromptMaxCharsForModel("grok-4.6") >= min_compact_chars);
 }

@@ -39,7 +39,15 @@ zig build test
 zig build --release=fast && ./scripts/install-plugin-bin.sh
 ./scripts/fetch-bridge.sh          # official binary → ~/.hitch/bridge/ (not in git)
 cp env.example ~/.hitch/env        # add your Cursor key
-~/.hitch/start.sh                  # or grok-plugin/bin/hitch
+~/.hitch/start.sh
+```
+
+Release binaries are GitHub release assets, not files in git. A tag `vX.Y.Z` must match the semantic version in `build.zig.zon`, `src/config.zig`, and both `plugin.json` files (`./scripts/check-version.sh`). Pushing that tag builds `hitch-aarch64-macos`, `hitch-x86_64-macos`, `hitch-aarch64-linux`, and `hitch-x86_64-linux`.
+
+```bash
+# after the version files all say 0.1.0
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 `GET http://127.0.0.1:8080/health` → `service=hitch`, `cursor.inference=sdk-bridge`.
@@ -52,7 +60,7 @@ Install the Grok plugin from a built binary (no source tree required):
 hitch install-plugin
 ```
 
-That writes `~/.grok/plugins/hitch`, copies this binary to `bin/hitch`, installs `~/.hitch/start.sh`, and enables hitch in `~/.grok/config.toml` when possible. SessionStart / UserPromptSubmit then start Hitch; they do not compile.
+That writes `~/.grok/plugins/hitch`, copies this binary to `bin/hitch` (gitignored), installs `~/.hitch/start.sh`, and enables hitch in `~/.grok/config.toml` when possible. SessionStart / UserPromptSubmit then start Hitch; they do not compile. Download a release asset or build locally. Do not commit the binary.
 
 ## License
 
