@@ -8,11 +8,15 @@ const ensure_sh = @embedFile("plugin-embed/ensure-gateway.sh");
 const hitch_md = @embedFile("plugin-embed/hitch.md");
 const start_sh = @embedFile("plugin-embed/start.sh");
 const stop_sh = @embedFile("plugin-embed/stop.sh");
+const env_example = @embedFile("plugin-embed/env.example");
+const fetch_bridge_sh = @embedFile("plugin-embed/fetch-bridge.sh");
+
+const exe_name = if (builtin.os.tag == .windows) "hitch.exe" else "hitch";
 
 pub fn run(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
-    const home = init.environ_map.get("HOME") orelse return error.NoHome;
+    const home = homeDir(init.environ_map) orelse return error.NoHome;
     const plugin = try std.fs.path.join(arena, &.{ home, ".grok", "plugins", "hitch" });
     const hitch_home = try std.fs.path.join(arena, &.{ home, ".hitch" });
     const cwd = Io.Dir.cwd();
@@ -29,12 +33,18 @@ pub fn run(init: std.process.Init) !void {
     try write(io, try std.fs.path.join(arena, &.{ plugin, "commands", "hitch.md" }), hitch_md);
     try writeExec(io, try std.fs.path.join(arena, &.{ hitch_home, "start.sh" }), start_sh);
     try writeExec(io, try std.fs.path.join(arena, &.{ hitch_home, "stop.sh" }), stop_sh);
+    try writeExec(io, try std.fs.path.join(arena, &.{ hitch_home, "fetch-bridge.sh" }), fetch_bridge_sh);
+    const env_path = try std.fs.path.join(arena, &.{ hitch_home, "env" });
+    if (!fileExists(io, env_path)) {
+        try write(io, env_path, env_example);
+    }
+    try write(io, try std.fs.path.join(arena, &.{ hitch_home, "env.example" }), env_example);
 
-    const exe = try selfExePath(arena);
-    const dest_bin = try std.fs.path.join(arena, &.{ plugin, "bin", "hitch" });
+    const exe = try std.process.executablePathAlloc(io, arena);
+    const dest_bin = try std.fs.path.join(arena, &.{ plugin, "bin", exe_name });
     try copyAbs(io, arena, exe, dest_bin);
     try chmodExec(dest_bin);
-    const home_bin = try std.fs.path.join(arena, &.{ hitch_home, "bin", "hitch" });
+    const home_bin = try std.fs.path.join(arena, &.{ hitch_home, "bin", exe_name });
     cwd.createDirPath(io, try std.fs.path.join(arena, &.{ hitch_home, "bin" })) catch {};
     try copyAbs(io, arena, exe, home_bin);
     try chmodExec(home_bin);
@@ -64,11 +74,29 @@ pub fn run(init: std.process.Init) !void {
         \\  plugin  {s}
         \\  binary  {s}
         \\  start   {s}/start.sh
+        \\  env     {s}/env
+        \\  bridge  {s}/fetch-bridge.sh
+        \\
+        \\Edit ~/.hitch/env and set CURSOR_API_KEY, then:
+        \\  ~/.hitch/fetch-bridge.sh
+        \\  ~/.hitch/start.sh
         \\
         \\Grok user plugins in ~/.grok/plugins/ are auto-trusted. If hitch is not listed, add it to [plugins].enabled or run:
         \\  grok plugin enable hitch
         \\
-    , .{ plugin, dest_bin, hitch_home });
+    , .{ plugin, dest_bin, hitch_home, hitch_home, hitch_home });
+}
+
+fn homeDir(env: *const std.process.Environ.Map) ?[]const u8 {
+    if (env.get("HOME")) |h| if (h.len > 0) return h;
+    if (env.get("USERPROFILE")) |h| if (h.len > 0) return h;
+    return null;
+}
+
+fn fileExists(io: Io, path: []const u8) bool {
+    const file = Io.Dir.cwd().openFile(io, path, .{}) catch return false;
+    file.close(io);
+    return true;
 }
 
 fn write(io: Io, path: []const u8, bytes: []const u8) !void {
@@ -81,6 +109,7 @@ fn writeExec(io: Io, path: []const u8, bytes: []const u8) !void {
 }
 
 fn chmodExec(path: []const u8) !void {
+    if (builtin.os.tag == .windows) return;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const z = try std.fmt.bufPrintZ(&buf, "{s}", .{path});
     _ = std.c.chmod(z, 0o755);
@@ -96,22 +125,6 @@ fn copyAbs(io: Io, arena: std.mem.Allocator, from: []const u8, to: []const u8) !
     var reader = file.readerStreaming(io, &rbuf);
     const data = try reader.interface.allocRemaining(arena, .limited(64 * 1024 * 1024));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = to, .data = data });
-}
-
-fn selfExePath(allocator: std.mem.Allocator) ![]u8 {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    switch (builtin.os.tag) {
-        .macos, .ios, .tvos, .watchos, .visionos => {
-            var n: u32 = buf.len;
-            if (std.c._NSGetExecutablePath(&buf, &n) != 0) return error.NameTooLong;
-            const p = std.mem.sliceTo(&buf, 0);
-            return allocator.dupe(u8, p);
-        },
-        else => {
-            const n = std.posix.readlink("/proc/self/exe", &buf) catch return error.NoExe;
-            return allocator.dupe(u8, buf[0..n]);
-        },
-    }
 }
 
 fn enableInConfig(io: Io, arena: std.mem.Allocator, home: []const u8) !void {

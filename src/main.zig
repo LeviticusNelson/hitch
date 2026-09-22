@@ -24,7 +24,8 @@ const version = config_mod.version;
 const install = @import("install.zig");
 
 pub fn main(init: std.process.Init) !void {
-    var argv = std.process.Args.Iterator.init(init.minimal.args);
+    var argv = try std.process.Args.Iterator.initAllocator(init.minimal.args, std.heap.page_allocator);
+    defer argv.deinit();
     _ = argv.next();
     if (argv.next()) |cmd| {
         if (std.mem.eql(u8, cmd, "install-plugin")) return install.run(init);
@@ -40,6 +41,9 @@ pub fn main(init: std.process.Init) !void {
                 \\  hitch                  start the gateway (env HOST/PORT)
                 \\  hitch install-plugin   install the Grok plugin from this binary
                 \\  hitch version
+                \\
+                \\install-plugin does not need a git checkout. It writes the plugin,
+                \\hooks, start/stop scripts, and ~/.hitch/env from bytes in this binary.
                 \\
             , .{version});
             return;

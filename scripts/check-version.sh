@@ -35,4 +35,13 @@ if [[ "$ref" == v* ]]; then
   fi
 fi
 
+if ! cmp -s env.example src/plugin-embed/env.example; then
+  echo "env.example and src/plugin-embed/env.example differ" >&2
+  exit 1
+fi
+if ! cmp -s scripts/fetch-bridge.sh src/plugin-embed/fetch-bridge.sh; then
+  echo "scripts/fetch-bridge.sh and src/plugin-embed/fetch-bridge.sh differ" >&2
+  exit 1
+fi
+
 echo "version $cfg"
