@@ -1,7 +1,7 @@
 const std = @import("std");
 const auth = @import("auth.zig");
 
-pub const version = "0.2.0";
+pub const version = "0.2.1";
 pub const sdk_version = "1.0.30";
 
 pub const Config = struct {

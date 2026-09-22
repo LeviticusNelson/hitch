@@ -3,7 +3,7 @@
 #
 #   irm https://raw.githubusercontent.com/LeviticusNelson/hitch/main/scripts/install.ps1 | iex
 #
-# $env:HITCH_VERSION = "v0.2.0"   # default: latest
+# $env:HITCH_VERSION = "v0.2.1"   # default: latest
 # $env:HITCH_PREFIX  = "$env:LOCALAPPDATA\hitch"
 
 $ErrorActionPreference = "Stop"
