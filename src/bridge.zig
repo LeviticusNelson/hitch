@@ -121,7 +121,7 @@ pub const Bridge = struct {
             }
             live_ptr.setSink(sink);
             defer live_ptr.setSink(.{});
-            return self.waitBoundary(arena, live_ptr, parsed, message_id, session_id, now);
+            return self.waitBoundary(arena, live_ptr, parsed, message_id, session_id, now, true);
         }
 
         const prefix = digest.stripLastUserBlock(parsed.flatten_text, parsed.last_user_text);
@@ -157,7 +157,7 @@ pub const Bridge = struct {
         self.mu.unlock(self.io);
         self.group.concurrent(self.io, sendLoop, .{live}) catch self.group.async(self.io, sendLoop, .{live});
         defer live.setSink(.{});
-        return self.waitBoundary(arena, live, parsed, message_id, session_id, now);
+        return self.waitBoundary(arena, live, parsed, message_id, session_id, now, false);
     }
 
     pub fn forgetSession(self: *Bridge, session_id: []const u8) void {
@@ -305,6 +305,7 @@ pub const Bridge = struct {
         message_id: []const u8,
         session_id: []const u8,
         now: i64,
+        after_tool: bool,
     ) !encode.Turn {
         // Parallel CallCustomTool RPCs arrive a few dozen ms apart. A tool that
         // shows up after reasoning has already started streaming is still a
@@ -346,10 +347,16 @@ pub const Bridge = struct {
                 late_ticks += 1;
             }
             if (protocol.waitBoundaryDone(n, finished, stable_ticks, late_ticks)) break;
-            // n>0: Grok still answering tools (ask_user_question). Do not time out.
-            // n==0 and Cursor never sends a delta after resume: first-event 45s.
-            if (protocol.waitBoundaryIdleTimedOut(n, finished, chars, nowMs(self.io) - last_progress, 45_000)) {
+            // n>0: Grok still answering tools. Do not time out.
+            // A new Send with no tokens at all: 45s. After a tool result, chars
+            // was cleared, so that 45s cutoff would return an empty turn.
+            const idle = nowMs(self.io) - last_progress;
+            if (protocol.waitBoundaryIdleTimedOut(n, finished, chars, after_tool, idle, 45_000)) {
                 std.log.warn("waitBoundary idle timeout agent={s} chars={d}", .{ live.agent_id, chars });
+                break;
+            }
+            if (after_tool and n == 0 and !finished and chars == 0 and idle > 180_000) {
+                std.log.warn("waitBoundary post-tool quiet agent={s}", .{live.agent_id});
                 break;
             }
             sleepMs(self.io, if (n > 0 or finished) 20 else 5);
