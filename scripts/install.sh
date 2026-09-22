@@ -4,7 +4,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/LeviticusNelson/hitch/main/scripts/install.sh | sh
 #
-# HITCH_VERSION=v0.1.0  (default: latest GitHub release)
+# HITCH_VERSION=v0.2.0  (default: latest GitHub release)
 # HITCH_PREFIX=$HOME/.local  (binary is placed in $HITCH_PREFIX/bin)
 set -eu
 

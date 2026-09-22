@@ -57,7 +57,7 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/LeviticusNelson/hitch/main/scripts/install.ps1 | iex
 ```
 
-Pin a version with `HITCH_VERSION=v0.1.0`. The script picks the asset from `uname` or `PROCESSOR_ARCHITECTURE`, puts `hitch` on `~/.local/bin` (or `%LOCALAPPDATA%\hitch` on Windows), and runs `hitch install-plugin`.
+Pin a version with `HITCH_VERSION=v0.2.0`. The script picks the asset from `uname` or `PROCESSOR_ARCHITECTURE`, puts `hitch` on `~/.local/bin` (or `%LOCALAPPDATA%\hitch` on Windows), and runs `hitch install-plugin`.
 
 ### Homebrew tap
 
@@ -69,7 +69,7 @@ brew install hitch
 hitch install-plugin
 ```
 
-`Formula/hitch.rb` checksums are placeholders until the `v0.1.0` assets exist. After the release, replace each `sha256` with `shasum -a 256` of that asset. Until then use the shell installer or a direct download.
+`Formula/hitch.rb` checksums are placeholders until the `v0.2.0` assets exist. After the release, replace each `sha256` with `shasum -a 256` of that asset. Until then use the shell installer or a direct download.
 
 ### Direct download
 
