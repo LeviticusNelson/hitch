@@ -100,9 +100,8 @@ pub const Bridge = struct {
     ) !encode.Turn {
         self.last_err = "";
         if (parsed.continuation.len > 0) {
-            var restored = false;
             if (self.liveForContinuation(session_id, parsed.continuation) == null) {
-                restored = (self.restorePending(arena, parsed, session_id) catch null) != null;
+                _ = self.restorePending(arena, parsed, session_id) catch null;
             }
             try self.preflightContinuation(arena, parsed, session_id);
             const live = self.liveForContinuation(session_id, parsed.continuation);
@@ -111,14 +110,6 @@ pub const Bridge = struct {
                 return error.UnknownToolId;
             };
             try self.applyContinuation(arena, live_ptr, parsed);
-            if (restored) {
-                const send_json_tmp = try std.fmt.allocPrint(arena,
-                    "{{\"agentId\":{f},\"message\":{{\"text\":\"\"}},\"options\":{{\"enableDeltas\":true{s}}}}}",
-                    .{ std.json.fmt(live_ptr.agent_id, .{}), try sendLocalSuffix(arena, parsed.tools, true) },
-                );
-                live_ptr.send_json = try self.gpa.dupe(u8, send_json_tmp);
-                self.group.concurrent(self.io, sendLoop, .{live_ptr}) catch self.group.async(self.io, sendLoop, .{live_ptr});
-            }
             live_ptr.setSink(sink);
             defer live_ptr.setSink(.{});
             return self.waitBoundary(arena, live_ptr, parsed, message_id, session_id, now, true);
@@ -261,6 +252,7 @@ pub const Bridge = struct {
         if (pending.len == 0) {
             if (self.continuationAlreadyApplied(parsed.continuation)) {
                 std.log.info("continuation already applied id={s}", .{parsed.continuation[0].call_id});
+                try self.resumeIfSendClosed(arena, live, parsed);
                 return;
             }
             if (parsed.continuation.len > 0) {
@@ -285,7 +277,6 @@ pub const Bridge = struct {
             self.last_err = try std.fmt.allocPrint(arena, "missing tool_result for: {s}", .{try joinIds(arena, missing.items)});
             return error.MissingToolResult;
         }
-        live.resetSegment();
         for (live_results) |c| {
             if (!self.hub.fulfill(c.call_id, c.output)) {
                 self.last_err = try std.fmt.allocPrint(arena, "unknown tool_use_id: {s}", .{c.call_id});
@@ -295,6 +286,44 @@ pub const Bridge = struct {
                 if (w.from_restore) self.hub.forget(w);
             }
         }
+        try self.resumeIfSendClosed(arena, live, parsed);
+    }
+
+    /// Cursor often ends Agent.send when it yields tools. The tool RPC is a
+    /// separate call. After the result is in, a closed send must be started
+    /// again or the next HTTP response is an empty assistant message.
+    fn resumeIfSendClosed(self: *Bridge, arena: std.mem.Allocator, live: *Live, parsed: protocol.Parsed) !void {
+        live.mu.lockUncancelable(self.io);
+        const busy = live.inflight;
+        live.mu.unlock(self.io);
+        if (busy) {
+            live.resetSegment();
+            return;
+        }
+        const send_json_tmp = try std.fmt.allocPrint(arena,
+            "{{\"agentId\":{f},\"message\":{{\"text\":\"\"}},\"options\":{{\"enableDeltas\":true{s}}}}}",
+            .{ std.json.fmt(live.agent_id, .{}), try sendLocalSuffix(arena, parsed.tools, true) },
+        );
+        const owned = try self.gpa.dupe(u8, send_json_tmp);
+        live.mu.lockUncancelable(self.io);
+        if (live.inflight) {
+            live.mu.unlock(self.io);
+            self.gpa.free(owned);
+            live.resetSegment();
+            return;
+        }
+        live.epoch += 1;
+        live.finished = false;
+        live.failed = false;
+        live.batch_ready = false;
+        live.text.clearRetainingCapacity();
+        live.thinking.clearRetainingCapacity();
+        self.gpa.free(live.send_json);
+        live.send_json = owned;
+        const epoch = live.epoch;
+        live.mu.unlock(self.io);
+        std.log.info("resume closed send agent={s} epoch={d}", .{ live.agent_id, epoch });
+        self.group.concurrent(self.io, sendLoop, .{live}) catch self.group.async(self.io, sendLoop, .{live});
     }
 
     fn waitBoundary(
@@ -558,7 +587,7 @@ pub const Bridge = struct {
         };
     }
 
-    fn sendCollect(self: *Bridge, arena: std.mem.Allocator, send_json: []const u8, live: *Live) !void {
+    fn sendCollect(self: *Bridge, arena: std.mem.Allocator, send_json: []const u8, live: *Live, epoch: u32) !void {
         const framed = try frame(arena, send_json);
         const url = try std.fmt.allocPrint(arena, "{s}/sdk.v1.SdkAgentService/Send", .{self.base_url});
         const uri = try std.Uri.parse(url);
@@ -586,7 +615,7 @@ pub const Bridge = struct {
                 error.EndStream => break,
                 else => return err,
             } orelse break;
-            applyEnvelope(arena, payload, live) catch {};
+            applyEnvelope(arena, payload, live, epoch) catch {};
         }
     }
 };
@@ -603,6 +632,8 @@ const Live = struct {
     thinking: std.ArrayList(u8) = .empty,
     finished: bool = false,
     failed: bool = false,
+    inflight: bool = false,
+    epoch: u32 = 0,
     agent_id: []u8,
     session_id: []u8,
     catalog: []protocol.Tool = &.{},
@@ -625,16 +656,20 @@ const Live = struct {
         self.batch_ready = false;
     }
 
-    fn finish(self: *Live) void {
+    fn finish(self: *Live, epoch: u32, failed: bool) void {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
+        if (self.epoch != epoch) return;
+        self.inflight = false;
         self.finished = true;
         self.batch_ready = true;
+        if (failed) self.failed = true;
     }
 
-    fn markBatchReady(self: *Live) void {
+    fn markBatchReady(self: *Live, epoch: u32) void {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
+        if (self.epoch != epoch) return;
         self.batch_ready = true;
     }
 
@@ -644,12 +679,8 @@ const Live = struct {
         return self.batch_ready;
     }
 
-    fn fail(self: *Live) void {
-        self.mu.lockUncancelable(self.io);
-        defer self.mu.unlock(self.io);
-        self.failed = true;
-        self.finished = true;
-        self.batch_ready = true;
+    fn fail(self: *Live, epoch: u32) void {
+        self.finish(epoch, true);
     }
 
     fn replacePublished(self: *Live, snaps: []const toolcb.WaiterSnap) !void {
@@ -662,12 +693,16 @@ const Live = struct {
 };
 
 fn sendLoop(live: *Live) void {
+    live.mu.lockUncancelable(live.io);
+    const epoch = live.epoch;
+    live.inflight = true;
+    live.mu.unlock(live.io);
     const arena = live.arena_state.allocator();
-    live.bridge.sendCollect(arena, live.send_json, live) catch {
-        live.fail();
+    live.bridge.sendCollect(arena, live.send_json, live, epoch) catch {
+        live.fail(epoch);
         return;
     };
-    live.finish();
+    live.finish(epoch, false);
 }
 
 fn effortJson(arena: std.mem.Allocator, effort: ?[]const u8) ![]const u8 {
@@ -732,13 +767,13 @@ fn readFrame(reader: *std.Io.Reader, arena: std.mem.Allocator) !?[]u8 {
     return payload;
 }
 
-fn applyEnvelope(arena: std.mem.Allocator, payload: []const u8, live: *Live) !void {
+fn applyEnvelope(arena: std.mem.Allocator, payload: []const u8, live: *Live, epoch: u32) !void {
     if (payload.len == 0 or payload[0] != '{') return;
     const parsed = std.json.parseFromSlice(std.json.Value, arena, payload, .{}) catch return;
     if (jsonx.get(parsed.value, "interactionUpdate")) |upd| {
         const typ = jsonx.getStr(upd, "type") orelse return;
         if (std.mem.eql(u8, typ, "turn-ended") or std.mem.eql(u8, typ, "turn_ended")) {
-            live.markBatchReady();
+            live.markBatchReady(epoch);
             return;
         }
         const piece = blk: {
@@ -747,9 +782,9 @@ fn applyEnvelope(arena: std.mem.Allocator, payload: []const u8, live: *Live) !vo
         };
         if (piece.len == 0) return;
         if (std.mem.eql(u8, typ, "text-delta") or std.mem.eql(u8, typ, "text_delta")) {
-            appendLive(live, .text, piece);
+            appendLive(live, .text, piece, epoch);
         } else if (std.mem.indexOf(u8, typ, "thinking") != null) {
-            appendLive(live, .thinking, piece);
+            appendLive(live, .thinking, piece, epoch);
         }
         return;
     }
@@ -761,13 +796,13 @@ fn applyEnvelope(arena: std.mem.Allocator, payload: []const u8, live: *Live) !vo
             live.mu.lockUncancelable(live.io);
             const empty = live.text.items.len == 0;
             live.mu.unlock(live.io);
-            if (piece.len > 0 and empty) appendLive(live, .text, piece);
+            if (piece.len > 0 and empty) appendLive(live, .text, piece, epoch);
         } else if (std.mem.eql(u8, typ, "thinking")) {
             const piece = jsonx.getStr(m, "text") orelse jsonx.getStr(m, "thinking") orelse jsonx.collectText(m, arena) catch "";
             live.mu.lockUncancelable(live.io);
             const empty = live.thinking.items.len == 0;
             live.mu.unlock(live.io);
-            if (piece.len > 0 and empty) appendLive(live, .thinking, piece);
+            if (piece.len > 0 and empty) appendLive(live, .thinking, piece, epoch);
         }
         return;
     }
@@ -777,14 +812,18 @@ fn applyEnvelope(arena: std.mem.Allocator, payload: []const u8, live: *Live) !vo
         live.mu.lockUncancelable(live.io);
         const empty = live.text.items.len == 0;
         live.mu.unlock(live.io);
-        if (final_text.len > 0 and empty) appendLive(live, .text, final_text);
+        if (final_text.len > 0 and empty) appendLive(live, .text, final_text, epoch);
     }
 }
 
 const LiveKind = enum { text, thinking };
 
-fn appendLive(live: *Live, kind: LiveKind, piece: []const u8) void {
+fn appendLive(live: *Live, kind: LiveKind, piece: []const u8, epoch: u32) void {
     live.mu.lockUncancelable(live.io);
+    if (live.epoch != epoch) {
+        live.mu.unlock(live.io);
+        return;
+    }
     const sink = live.sink;
     switch (kind) {
         .text => live.text.appendSlice(live.gpa, piece) catch {},
