@@ -28,39 +28,83 @@ Hitch is **not affiliated with Cursor, xAI, Anthropic, or OpenAI**. Protocol gol
 
 See [TODO.md](TODO.md).
 
-## Quick start
+## Install the binary
 
-Zig 0.16. Official bridge is optional until you want live Cursor.
+You do not need to clone the repository. `hitch install-plugin` writes the Grok plugin, hooks, start and stop scripts, `~/.hitch/env`, and `~/.hitch/fetch-bridge.sh` from bytes stored in the binary.
+
+Release assets (tag `vX.Y.Z`):
+
+| OS | CPU | Asset |
+|---|---|---|
+| macOS | Apple Silicon (arm64) | `hitch-aarch64-macos` |
+| macOS | Intel (x86_64) | `hitch-x86_64-macos` |
+| Linux | arm64 | `hitch-aarch64-linux` |
+| Linux | x86_64 | `hitch-x86_64-linux` |
+| Windows | arm64 | `hitch-aarch64-windows.exe` |
+| Windows | x86_64 | `hitch-x86_64-windows.exe` |
+
+### Shell installer
+
+macOS or Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/LeviticusNelson/hitch/main/scripts/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/LeviticusNelson/hitch/main/scripts/install.ps1 | iex
+```
+
+Pin a version with `HITCH_VERSION=v0.2.0`. The script picks the asset from `uname` or `PROCESSOR_ARCHITECTURE`, puts `hitch` on `~/.local/bin` (or `%LOCALAPPDATA%\hitch` on Windows), and runs `hitch install-plugin`.
+
+### Homebrew tap
+
+The formula lives at `Formula/hitch.rb` in this repository. Tap that URL (this is not a `homebrew-hitch` repo).
+
+```bash
+brew tap LeviticusNelson/hitch https://github.com/LeviticusNelson/hitch
+brew install hitch
+hitch install-plugin
+```
+
+`Formula/hitch.rb` checksums are placeholders until the `v0.2.0` assets exist. After the release, replace each `sha256` with `shasum -a 256` of that asset. Until then use the shell installer or a direct download.
+
+### Direct download
+
+```bash
+# Apple Silicon. Swap the asset name from the table for other machines.
+curl -fL -o hitch https://github.com/LeviticusNelson/hitch/releases/latest/download/hitch-aarch64-macos
+chmod +x hitch
+./hitch install-plugin
+```
+
+Then edit `~/.hitch/env`, download the official bridge, and start:
+
+```bash
+# set CURSOR_API_KEY in ~/.hitch/env
+~/.hitch/fetch-bridge.sh
+~/.hitch/start.sh
+```
+
+`GET http://127.0.0.1:8080/health` → `service=hitch`, `cursor.inference=sdk-bridge`.
+
+Windows has no `start.sh`. Run `hitch.exe` in a terminal after editing `%USERPROFILE%\.hitch\env`. The Grok hook scripts are bash. On Windows, run them from Git Bash, or start `hitch.exe` yourself.
+
+### From source
+
+Zig 0.16. The compiled binary is not in git.
 
 ```bash
 git clone https://github.com/LeviticusNelson/hitch.git
 cd hitch
 zig build test
-zig build --release=fast && ./scripts/install-plugin-bin.sh
-./scripts/fetch-bridge.sh          # official binary → ~/.hitch/bridge/ (not in git)
-cp env.example ~/.hitch/env        # add your Cursor key
-~/.hitch/start.sh
-```
-
-Release binaries are GitHub release assets, not files in git. A tag `vX.Y.Z` must match the semantic version in `build.zig.zon`, `src/config.zig`, and both `plugin.json` files (`./scripts/check-version.sh`). Pushing that tag builds `hitch-aarch64-macos`, `hitch-x86_64-macos`, `hitch-aarch64-linux`, and `hitch-x86_64-linux`.
-
-```bash
-# after the version files all say 0.1.0
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-`GET http://127.0.0.1:8080/health` → `service=hitch`, `cursor.inference=sdk-bridge`.
-
-Install the Grok plugin from a built binary (no source tree required):
-
-```bash
+zig build --release=fast
 ./zig-out/bin/hitch install-plugin
-# or, after copying hitch onto PATH:
-hitch install-plugin
 ```
 
-That writes `~/.grok/plugins/hitch`, copies this binary to `bin/hitch` (gitignored), installs `~/.hitch/start.sh`, and enables hitch in `~/.grok/config.toml` when possible. SessionStart / UserPromptSubmit then start Hitch; they do not compile. Download a release asset or build locally. Do not commit the binary.
+A tag `vX.Y.Z` must match the version in `build.zig.zon`, `src/config.zig`, and both `plugin.json` files (`./scripts/check-version.sh`). Pushing that tag builds the assets in the table.
 
 ## License
 

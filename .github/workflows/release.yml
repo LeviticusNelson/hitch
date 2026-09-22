@@ -28,6 +28,12 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-linux-musl
             asset: hitch-x86_64-linux
+          - os: ubuntu-latest
+            target: aarch64-windows-gnu
+            asset: hitch-aarch64-windows.exe
+          - os: ubuntu-latest
+            target: x86_64-windows-gnu
+            asset: hitch-x86_64-windows.exe
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
@@ -38,10 +44,13 @@ jobs:
       - name: release build
         run: zig build --release=fast -Dtarget=${{ matrix.target }}
       - name: pack binary
+        shell: bash
         run: |
           mkdir -p dist
-          cp zig-out/bin/hitch "dist/${{ matrix.asset }}"
-          chmod +x "dist/${{ matrix.asset }}"
+          bin="$(find zig-out/bin -type f \( -name hitch -o -name hitch.exe \) | head -1)"
+          test -n "$bin"
+          cp "$bin" "dist/${{ matrix.asset }}"
+          chmod +x "dist/${{ matrix.asset }}" || true
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
