@@ -452,11 +452,11 @@ pub fn waitBoundaryDone(n: usize, finished: bool, stable_ticks: u32, late_ticks:
     return finished and late_ticks >= 8;
 }
 
-/// First-event timeout only. A Send that already produced text or thinking
-/// is still in progress (GPT often goes quiet after a tool result). Cutting
-/// that gap made Grok retry a tool id hitch had already fulfilled.
-pub fn waitBoundaryIdleTimedOut(n: usize, finished: bool, chars: usize, idle_ms: i64, limit_ms: i64) bool {
-    if (n > 0 or finished or chars > 0) return false;
+/// First-event timeout for a new Send that has produced nothing.
+/// After a tool result the segment buffer is cleared, so chars is 0 even
+/// though Cursor is still working. That path must not use this cutoff.
+pub fn waitBoundaryIdleTimedOut(n: usize, finished: bool, chars: usize, after_tool: bool, idle_ms: i64, limit_ms: i64) bool {
+    if (n > 0 or finished or chars > 0 or after_tool) return false;
     return idle_ms > limit_ms;
 }
 
@@ -926,12 +926,13 @@ test "waitBoundaryDone flushes tools after reasoning and waits for a late CallCu
     try std.testing.expect(waitBoundaryDone(2, true, 2, 0));
 }
 
-test "waitBoundaryIdleTimedOut only when Cursor sends nothing" {
-    try std.testing.expect(!waitBoundaryIdleTimedOut(1, false, 0, 60_000, 45_000));
-    try std.testing.expect(!waitBoundaryIdleTimedOut(0, true, 0, 60_000, 45_000));
-    try std.testing.expect(!waitBoundaryIdleTimedOut(0, false, 0, 45_000, 45_000));
-    try std.testing.expect(waitBoundaryIdleTimedOut(0, false, 0, 45_001, 45_000));
-    try std.testing.expect(!waitBoundaryIdleTimedOut(0, false, 561, 60_000, 45_000));
+test "waitBoundaryIdleTimedOut only when a new Send stays empty" {
+    try std.testing.expect(!waitBoundaryIdleTimedOut(1, false, 0, false, 60_000, 45_000));
+    try std.testing.expect(!waitBoundaryIdleTimedOut(0, true, 0, false, 60_000, 45_000));
+    try std.testing.expect(!waitBoundaryIdleTimedOut(0, false, 0, false, 45_000, 45_000));
+    try std.testing.expect(waitBoundaryIdleTimedOut(0, false, 0, false, 45_001, 45_000));
+    try std.testing.expect(!waitBoundaryIdleTimedOut(0, false, 561, false, 60_000, 45_000));
+    try std.testing.expect(!waitBoundaryIdleTimedOut(0, false, 0, true, 120_000, 45_000));
 }
 
 test "continuationRequiredIds uses published batch over later hub waiters" {
