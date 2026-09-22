@@ -452,10 +452,11 @@ pub fn waitBoundaryDone(n: usize, finished: bool, stable_ticks: u32, late_ticks:
     return finished and late_ticks >= 8;
 }
 
-/// Cursor Send after a tool resume can sit with no waiters and no end event.
-/// Tools in flight (n > 0) wait for Grok. Finished streams use waitBoundaryDone.
-pub fn waitBoundaryIdleTimedOut(n: usize, finished: bool, idle_ms: i64, limit_ms: i64) bool {
-    if (n > 0 or finished) return false;
+/// First-event timeout only. A Send that already produced text or thinking
+/// is still in progress (GPT often goes quiet after a tool result). Cutting
+/// that gap made Grok retry a tool id hitch had already fulfilled.
+pub fn waitBoundaryIdleTimedOut(n: usize, finished: bool, chars: usize, idle_ms: i64, limit_ms: i64) bool {
+    if (n > 0 or finished or chars > 0) return false;
     return idle_ms > limit_ms;
 }
 
@@ -926,10 +927,11 @@ test "waitBoundaryDone flushes tools after reasoning and waits for a late CallCu
 }
 
 test "waitBoundaryIdleTimedOut only when Cursor sends nothing" {
-    try std.testing.expect(!waitBoundaryIdleTimedOut(1, false, 60_000, 45_000));
-    try std.testing.expect(!waitBoundaryIdleTimedOut(0, true, 60_000, 45_000));
-    try std.testing.expect(!waitBoundaryIdleTimedOut(0, false, 45_000, 45_000));
-    try std.testing.expect(waitBoundaryIdleTimedOut(0, false, 45_001, 45_000));
+    try std.testing.expect(!waitBoundaryIdleTimedOut(1, false, 0, 60_000, 45_000));
+    try std.testing.expect(!waitBoundaryIdleTimedOut(0, true, 0, 60_000, 45_000));
+    try std.testing.expect(!waitBoundaryIdleTimedOut(0, false, 0, 45_000, 45_000));
+    try std.testing.expect(waitBoundaryIdleTimedOut(0, false, 0, 45_001, 45_000));
+    try std.testing.expect(!waitBoundaryIdleTimedOut(0, false, 561, 60_000, 45_000));
 }
 
 test "continuationRequiredIds uses published batch over later hub waiters" {

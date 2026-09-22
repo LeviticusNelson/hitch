@@ -98,6 +98,7 @@ pub const Bridge = struct {
         now: i64,
         sink: Sink,
     ) !encode.Turn {
+        self.last_err = "";
         if (parsed.continuation.len > 0) {
             var restored = false;
             if (self.liveForContinuation(session_id, parsed.continuation) == null) {
@@ -204,6 +205,7 @@ pub const Bridge = struct {
         const pool: []const protocol.ToolResult = if (parsed.all_outputs.len > 0) parsed.all_outputs else parsed.continuation;
         const live_results = try protocol.selectPendingResults(arena, pool, pending);
         if (pending.len == 0 or live_results.len == 0) {
+            if (self.continuationAlreadyApplied(parsed.continuation)) return;
             self.last_err = try std.fmt.allocPrint(arena, "unknown tool_use_id: {s}", .{parsed.continuation[0].call_id});
             return error.UnknownToolId;
         }
@@ -213,21 +215,33 @@ pub const Bridge = struct {
         }
     }
 
+    fn liveByAgent(self: *Bridge, agent_id: []const u8) ?*Live {
+        if (agent_id.len == 0) return null;
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        var it = self.lives.valueIterator();
+        while (it.next()) |ptr| {
+            const live = ptr.*;
+            if (std.mem.eql(u8, live.agent_id, agent_id)) return live;
+        }
+        return null;
+    }
+
     pub fn liveForContinuation(self: *Bridge, session_id: []const u8, continuation: []const protocol.ToolResult) ?*Live {
         if (self.getLive(session_id)) |live| return live;
         for (continuation) |c| {
-            const w = self.hub.get(c.call_id) orelse continue;
-            self.mu.lockUncancelable(self.io);
-            defer self.mu.unlock(self.io);
-            var it = self.lives.valueIterator();
-            while (it.next()) |ptr| {
-                const live = ptr.*;
-                if (w.agent_id.len == 0 or live.agent_id.len == 0 or std.mem.eql(u8, live.agent_id, w.agent_id)) {
-                    return live;
-                }
-            }
+            const agent_id = if (self.hub.get(c.call_id)) |w| w.agent_id else self.hub.spentAgent(c.call_id) orelse continue;
+            if (self.liveByAgent(agent_id)) |live| return live;
         }
         return null;
+    }
+
+    fn continuationAlreadyApplied(self: *Bridge, continuation: []const protocol.ToolResult) bool {
+        if (continuation.len == 0) return false;
+        for (continuation) |c| {
+            if (!self.hub.isSpent(c.call_id)) return false;
+        }
+        return true;
     }
 
     fn applyContinuation(self: *Bridge, arena: std.mem.Allocator, live: *Live, parsed: protocol.Parsed) !void {
@@ -245,6 +259,10 @@ pub const Bridge = struct {
             live_results.len,
         });
         if (pending.len == 0) {
+            if (self.continuationAlreadyApplied(parsed.continuation)) {
+                std.log.info("continuation already applied id={s}", .{parsed.continuation[0].call_id});
+                return;
+            }
             if (parsed.continuation.len > 0) {
                 self.last_err = try std.fmt.allocPrint(arena, "unknown tool_use_id: {s}", .{parsed.continuation[0].call_id});
                 return error.UnknownToolId;
@@ -330,7 +348,7 @@ pub const Bridge = struct {
             if (protocol.waitBoundaryDone(n, finished, stable_ticks, late_ticks)) break;
             // n>0: Grok still answering tools (ask_user_question). Do not time out.
             // n==0 and Cursor never sends a delta after resume: first-event 45s.
-            if (protocol.waitBoundaryIdleTimedOut(n, finished, nowMs(self.io) - last_progress, 45_000)) {
+            if (protocol.waitBoundaryIdleTimedOut(n, finished, chars, nowMs(self.io) - last_progress, 45_000)) {
                 std.log.warn("waitBoundary idle timeout agent={s} chars={d}", .{ live.agent_id, chars });
                 break;
             }
