@@ -126,7 +126,7 @@ pub fn tryCall(io: Io, gpa: std.mem.Allocator, server: Server, tool_name: []cons
     var out_buf: [4096]u8 = undefined;
     var writer = stdin.writerStreaming(io, &in_buf);
     var reader = stdout.readerStreaming(io, &out_buf);
-    const init_msg = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"hitch\",\"version\":\"0.2.1\"}}}";
+    const init_msg = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"hitch\",\"version\":\"0.2.2\"}}}";
     writeMsg(&writer.interface, init_msg) catch return null;
     _ = readMsg(gpa, &reader.interface) orelse return null;
     writeMsg(&writer.interface, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}") catch return null;
