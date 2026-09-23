@@ -25,10 +25,33 @@ healthy() {
   curl -fsS -m 1 http://127.0.0.1:8080/health 2>/dev/null | python3 -c 'import sys,json; h=json.load(sys.stdin); sys.exit(0 if h.get("status")=="ok" and (h.get("cursor") or {}).get("inference")=="sdk-bridge" else 1)' 2>/dev/null
 }
 
+# A live hitch process must not be replaced. Connection errors only start
+# hitch when nothing is running.
+process_running() {
+  local pidfile="${HITCH_PID_FILE:-$HOME/.hitch/gateway.pid}"
+  if [[ -f "$pidfile" ]]; then
+    local pid
+    pid="$(tr -d '[:space:]' <"$pidfile" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  local listen_pid cmd
+  listen_pid="$(lsof -nP -t -iTCP:8080 -sTCP:LISTEN 2>/dev/null | head -1 || true)"
+  if [[ -n "$listen_pid" ]]; then
+    cmd="$(ps -p "$listen_pid" -o comm= 2>/dev/null || true)"
+    [[ "$cmd" == *hitch* ]]
+    return
+  fi
+  return 1
+}
+
 {
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) event=${GROK_HOOK_EVENT:-?} bin=$BIN"
   if healthy; then
     echo "already healthy"
+  elif process_running; then
+    echo "hitch process already running; not starting another"
   elif [[ ! -x "$BIN" ]]; then
     echo "missing compiled plugin binary $BIN"
   elif [[ -x "$START" ]]; then
