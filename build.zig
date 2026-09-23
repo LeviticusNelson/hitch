@@ -12,8 +12,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            // musl targets pull std.c (chmod) and Zig refuses that unless libc is requested.
-            .link_libc = target.result.abi == .musl,
+            // musl and Windows-gnu pull std.c (chmod, getenv, kill) and Zig
+            // refuses that unless libc is requested.
+            .link_libc = target.result.abi == .musl or target.result.os.tag == .windows,
         }),
     });
     b.installArtifact(exe);
