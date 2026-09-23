@@ -39,6 +39,7 @@ pub const Bridge = struct {
     last_err: []const u8 = "",
     persist_path: []const u8 = "",
     pool: ?*pool_mod.Pool = null,
+    cursor_mcp: bool = true,
 
     pub fn unary(self: *Bridge, arena: std.mem.Allocator, path: []const u8, payload: []const u8) ![]u8 {
         const url = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.base_url, path });
@@ -472,7 +473,7 @@ pub const Bridge = struct {
         if (self.pool) |p| {
             if (p.bindOrPick(session_id)) |picked| api_key = picked;
         }
-        const tools_field: []const u8 = if (parsed.tools.len > 0) ",\"tools\":{\"names\":[\"mcp\"]}" else "";
+        const tools_field: []const u8 = if (parsed.tools.len > 0 or self.cursor_mcp) ",\"tools\":{\"names\":[\"mcp\"]}" else "";
         const created = self.createAgent(arena, parsed, api_key, tools_field) catch |err| blk: {
             if (self.pool) |p| {
                 if (p.failover(session_id, api_key)) |next_key| {
@@ -498,12 +499,13 @@ pub const Bridge = struct {
 
     fn createAgent(self: *Bridge, arena: std.mem.Allocator, parsed: protocol.Parsed, api_key: []const u8, tools_field: []const u8) ![]u8 {
         const create = try std.fmt.allocPrint(arena,
-            "{{\"options\":{{\"model\":{{\"id\":{f}{s}}},\"apiKey\":{f},\"local\":{{\"cwd\":[{f}]{s}}},\"disallowedTools\":[\"shell\",\"read\",\"edit\",\"task\",\"webSearch\",\"webFetch\"]{s}}}}}",
+            "{{\"options\":{{\"model\":{{\"id\":{f}{s}}},\"apiKey\":{f},\"local\":{{\"cwd\":[{f}]{s}{s}}},\"disallowedTools\":[\"shell\",\"read\",\"edit\",\"task\",\"webSearch\",\"webFetch\"]{s}}}}}",
             .{
                 std.json.fmt(parsed.upstream_model, .{}),
                 try effortJson(arena, models.cursorEffortParam(parsed.upstream_model, parsed.effort)),
                 std.json.fmt(api_key, .{}),
                 std.json.fmt(self.workspace, .{}),
+                if (self.cursor_mcp) ",\"settingSources\":[\"user\",\"project\",\"plugins\"]" else "",
                 try customToolsJson(arena, parsed.tools),
                 tools_field,
             },

@@ -25,6 +25,9 @@ pub const Config = struct {
     max_runs_per_key: u32 = 32,
     capacity_wait_ms: u32 = 15_000,
     capacity_poll_ms: u32 = 200,
+    /// When true, CreateAgent loads Cursor user/project/plugin MCP config,
+    /// and a failed client MCP tool call is retried against ~/.cursor/mcp.json.
+    cursor_mcp: bool = true,
 
     pub fn fromEnv(env: *const std.process.Environ.Map, allocator: std.mem.Allocator) !Config {
         var c: Config = .{};
@@ -45,6 +48,9 @@ pub const Config = struct {
         if (env.get("MAX_RUNS_PER_KEY")) |n| c.max_runs_per_key = std.fmt.parseInt(u32, n, 10) catch c.max_runs_per_key;
         if (env.get("CAPACITY_WAIT_MS")) |n| c.capacity_wait_ms = std.fmt.parseInt(u32, n, 10) catch c.capacity_wait_ms;
         if (env.get("CAPACITY_POLL_MS")) |n| c.capacity_poll_ms = std.fmt.parseInt(u32, n, 10) catch c.capacity_poll_ms;
+        if (env.get("HITCH_CURSOR_MCP")) |v| {
+            if (std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "false")) c.cursor_mcp = false;
+        }
         if (env.get("MANAGED_CURSOR_KEYS")) |raw| {
             c.managed_cursor_keys = try splitComma(allocator, raw);
         } else if (c.managed_cursor_key) |one| {
