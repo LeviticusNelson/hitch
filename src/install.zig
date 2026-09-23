@@ -58,11 +58,12 @@ pub fn run(init: std.process.Init) !void {
         \\{{
         \\  "hooks": {{
         \\    "SessionStart": [{{"hooks": [{{"type": "command", "command": "{s}", "timeout": 45}}]}}],
-        \\    "UserPromptSubmit": [{{"hooks": [{{"type": "command", "command": "{s}", "timeout": 45}}]}}]
+        \\    "UserPromptSubmit": [{{"hooks": [{{"type": "command", "command": "{s}", "timeout": 45}}]}}],
+        \\    "StopFailure": [{{"hooks": [{{"type": "command", "command": "{s}", "timeout": 45}}]}}]
         \\  }}
         \\}}
         \\
-    , .{ ensure_path, ensure_path });
+    , .{ ensure_path, ensure_path, ensure_path });
     try write(io, try std.fs.path.join(arena, &.{ hooks_dir, "hitch.json" }), user_hook);
 
     enableInConfig(io, arena, home) catch |err| {
