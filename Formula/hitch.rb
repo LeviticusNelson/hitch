@@ -1,27 +1,27 @@
 class Hitch < Formula
   desc "Cursor models on the APIs your harness already speaks"
   homepage "https://github.com/LeviticusNelson/hitch"
-  version "0.2.1"
+  version "0.2.2"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/LeviticusNelson/hitch/releases/download/v0.2.1/hitch-aarch64-macos"
+      url "https://github.com/LeviticusNelson/hitch/releases/download/v0.2.2/hitch-aarch64-macos"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
     on_intel do
-      url "https://github.com/LeviticusNelson/hitch/releases/download/v0.2.1/hitch-x86_64-macos"
+      url "https://github.com/LeviticusNelson/hitch/releases/download/v0.2.2/hitch-x86_64-macos"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/LeviticusNelson/hitch/releases/download/v0.2.1/hitch-aarch64-linux"
+      url "https://github.com/LeviticusNelson/hitch/releases/download/v0.2.2/hitch-aarch64-linux"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
     on_intel do
-      url "https://github.com/LeviticusNelson/hitch/releases/download/v0.2.1/hitch-x86_64-linux"
+      url "https://github.com/LeviticusNelson/hitch/releases/download/v0.2.2/hitch-x86_64-linux"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
   end
@@ -43,7 +43,7 @@ class Hitch < Formula
         # set CURSOR_API_KEY in ~/.hitch/env
         ~/.hitch/start.sh
 
-      Checksums in this formula are placeholders until the v0.2.1
+      Checksums in this formula are placeholders until the v0.2.2
       release assets exist. Replace them with `shasum -a 256` of each asset.
     EOS
   end
