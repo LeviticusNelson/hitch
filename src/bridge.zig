@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const Io = std.Io;
 const digest = @import("digest.zig");
@@ -28,7 +29,11 @@ pub const Bridge = struct {
     bearer: []const u8,
     api_key: []const u8,
     workspace: []const u8,
+    bin: []const u8 = "",
+    tool_callback_url: []const u8 = "",
+    tool_callback_token: []const u8 = "",
     child: ?std.process.Child = null,
+    respawn_mu: Io.Mutex = .init,
     agents: std.StringHashMap(BoundAgent) = undefined,
     efforts: std.StringHashMap([]const u8) = undefined,
     lives: std.StringHashMap(*Live) = undefined,
@@ -40,7 +45,44 @@ pub const Bridge = struct {
     persist_path: []const u8 = "",
     pool: ?*pool_mod.Pool = null,
 
+    pub fn ensureAlive(self: *Bridge) !void {
+        self.respawn_mu.lockUncancelable(self.io);
+        defer self.respawn_mu.unlock(self.io);
+        if (childAlive(self.child)) return;
+        try self.restartChildLocked();
+    }
+
+    pub fn recoverConnection(self: *Bridge) !void {
+        self.respawn_mu.lockUncancelable(self.io);
+        defer self.respawn_mu.unlock(self.io);
+        try self.restartChildLocked();
+    }
+
+    fn restartChildLocked(self: *Bridge) !void {
+        std.log.warn("cursor-sdk-bridge is down; restarting", .{});
+        if (self.child) |*c| {
+            _ = c.wait(self.io) catch {};
+            self.child = null;
+        }
+        const booted = try bootChild(self.io, self.gpa, self.bin, self.workspace, self.tool_callback_url, self.tool_callback_token);
+        self.base_url = booted.url;
+        self.bearer = booted.bearer;
+        self.child = booted.child;
+        self.client = .{ .allocator = self.gpa, .io = self.io };
+    }
+
     pub fn unary(self: *Bridge, arena: std.mem.Allocator, path: []const u8, payload: []const u8) ![]u8 {
+        try self.ensureAlive();
+        return self.unaryOnce(arena, path, payload) catch |err| switch (err) {
+            error.ConnectionRefused => {
+                try self.recoverConnection();
+                return self.unaryOnce(arena, path, payload);
+            },
+            else => |e| return e,
+        };
+    }
+
+    fn unaryOnce(self: *Bridge, arena: std.mem.Allocator, path: []const u8, payload: []const u8) ![]u8 {
         const url = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.base_url, path });
         const authz = try std.fmt.allocPrint(arena, "Bearer {s}", .{self.bearer});
         var aw: std.Io.Writer.Allocating = .init(arena);
@@ -98,6 +140,7 @@ pub const Bridge = struct {
         now: i64,
         sink: Sink,
     ) !encode.Turn {
+        try self.ensureAlive();
         self.last_err = "";
         if (parsed.continuation.len > 0) {
             if (self.liveForContinuation(session_id, parsed.continuation) == null) {
@@ -920,18 +963,31 @@ pub fn findBridgeBinary(env: *const std.process.Environ.Map, allocator: std.mem.
     return std.fs.path.join(allocator, &.{ home, ".hitch", "bridge", "v1.0.30", "bin", "cursor-sdk-bridge" }) catch null;
 }
 
-pub fn spawn(
+const Booted = struct {
+    child: std.process.Child,
+    url: []u8,
+    bearer: []u8,
+};
+
+const probe_kill = struct {
+    extern "c" fn kill(pid: i32, sig: i32) c_int;
+}.kill;
+
+fn childAlive(child: ?std.process.Child) bool {
+    const c = child orelse return false;
+    const id = c.id orelse return false;
+    if (builtin.os.tag == .windows) return true;
+    return probe_kill(@intCast(id), 0) == 0;
+}
+
+fn bootChild(
     io: Io,
     gpa: std.mem.Allocator,
-    env: *const std.process.Environ.Map,
     bin: []const u8,
     workspace: []const u8,
-    api_key: []const u8,
     tool_callback_url: []const u8,
     tool_callback_token: []const u8,
-    hub: *toolcb.Hub,
-    group: *Io.Group,
-) !Bridge {
+) !Booted {
     std.Io.Dir.cwd().createDirPath(io, workspace) catch {};
     const child = try std.process.spawn(io, .{
         .argv = &.{
@@ -951,15 +1007,35 @@ pub fn spawn(
     var reader = stderr.readerStreaming(io, &buf);
     const ready = try waitReady(&reader.interface, gpa);
     const token = try readToken(io, gpa, ready.auth_token_file);
-    const br = Bridge{
+    return .{ .child = child, .url = ready.url, .bearer = token };
+}
+
+pub fn spawn(
+    io: Io,
+    gpa: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    bin: []const u8,
+    workspace: []const u8,
+    api_key: []const u8,
+    tool_callback_url: []const u8,
+    tool_callback_token: []const u8,
+    hub: *toolcb.Hub,
+    group: *Io.Group,
+) !Bridge {
+    _ = env;
+    const booted = try bootChild(io, gpa, bin, workspace, tool_callback_url, tool_callback_token);
+    return .{
         .io = io,
         .gpa = gpa,
         .client = .{ .allocator = gpa, .io = io },
-        .base_url = ready.url,
-        .bearer = token,
+        .base_url = booted.url,
+        .bearer = booted.bearer,
         .api_key = api_key,
         .workspace = workspace,
-        .child = child,
+        .bin = bin,
+        .tool_callback_url = tool_callback_url,
+        .tool_callback_token = tool_callback_token,
+        .child = booted.child,
         .agents = std.StringHashMap(BoundAgent).init(gpa),
         .efforts = std.StringHashMap([]const u8).init(gpa),
         .lives = std.StringHashMap(*Live).init(gpa),
@@ -967,8 +1043,6 @@ pub fn spawn(
         .hub = hub,
         .group = group,
     };
-    _ = env;
-    return br;
 }
 
 const Ready = struct {
