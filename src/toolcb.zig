@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const ids = @import("ids.zig");
 const jsonx = @import("jsonx.zig");
+const mcpfallback = @import("mcpfallback.zig");
 const rawhttp = @import("rawhttp.zig");
 
 /// Host for SdkCustomToolCallbackService. Grok executes tools; we hold the
@@ -22,6 +23,7 @@ pub const Hub = struct {
     io: Io,
     gpa: std.mem.Allocator,
     token: []const u8 = "",
+    cursor_mcp: bool = true,
     mu: Io.Mutex = .init,
     cond: Io.Condition = .init,
     by_id: std.StringHashMap(*Waiter),
@@ -303,7 +305,12 @@ fn serve(hub: *Hub, req: rawhttp.Incoming, reply: *rawhttp.Reply, arena: std.mem
         call.tool_call_id = try ids.hexId(hub.io, "call_", arena);
     }
     const w = try hub.announce(call);
-    const output = hub.wait(w) orelse "";
+    var output = hub.wait(w) orelse "";
+    if (hub.cursor_mcp) {
+        if (mcpfallback.maybeFallback(hub.io, hub.gpa, call.tool_name, call.args_json, output)) |replaced| {
+            output = replaced;
+        }
+    }
     const body = try std.fmt.allocPrint(arena,
         "{{\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":{f}}}]}}}}",
         .{std.json.fmt(output, .{})},

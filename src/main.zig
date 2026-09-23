@@ -63,6 +63,7 @@ pub fn main(init: std.process.Init) !void {
     const gpa = std.heap.page_allocator;
     var catalog_store: cursor_api.Catalog = undefined;
     var hub = toolcb.Hub.init(io, gpa);
+    hub.cursor_mcp = cfg.cursor_mcp;
     var app = httpx.App{
         .io = io,
         .gpa = gpa,
@@ -141,6 +142,7 @@ pub fn main(init: std.process.Init) !void {
                         app.bridge = &bridge_client;
                         app.cursor_bridge = b;
                         app.use_fake = false;
+                        b.cursor_mcp = cfg.cursor_mcp;
                         b.persist_path = try std.fs.path.join(arena, &.{ cfg.state_dir, "pending.jsonl" });
                         b.pool = app.pool;
                         const pending = persist.loadAll(io, b.persist_path, arena) catch &.{};
@@ -232,6 +234,7 @@ test {
     _ = bridge;
     _ = cursor_api;
     _ = toolcb;
+    _ = @import("mcpfallback.zig");
     _ = rawhttp;
 }
 
