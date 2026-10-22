@@ -1187,7 +1187,7 @@ pub fn findBridgeBinary(env: *const std.process.Environ.Map, allocator: std.mem.
         if (p.len > 0) return p;
     }
     const home = env.get("HOME") orelse return null;
-    return std.fs.path.join(allocator, &.{ home, ".hitch", "bridge", "v1.0.30", "bin", "cursor-sdk-bridge" }) catch null;
+    return std.fs.path.join(allocator, &.{ home, ".hitch", "bridge", "v1.0.40", "bin", "cursor-sdk-bridge" }) catch null;
 }
 
 const Booted = struct {

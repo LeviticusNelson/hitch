@@ -2,7 +2,7 @@ const std = @import("std");
 const auth = @import("auth.zig");
 
 pub const version = "0.2.2";
-pub const sdk_version = "1.0.30";
+pub const sdk_version = "1.0.40";
 
 pub const Config = struct {
     host: []const u8 = "127.0.0.1",

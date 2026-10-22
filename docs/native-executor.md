@@ -1,6 +1,6 @@
 # Native Zig Cursor executor?
 
-Checked 2026-09-19 against `~/.cursor-sdk2api-zig/bridge/v1.0.30/bin/cursor-sdk-bridge`.
+Checked 2026-09-19 against `~/.hitch/bridge/v1.0.40/bin/cursor-sdk-bridge`.
 
 ## What the binary is
 
