@@ -271,6 +271,38 @@ pub const Bridge = struct {
         return null;
     }
 
+    fn failLive(self: *Bridge, arena: std.mem.Allocator, live: *Live) !bool {
+        live.mu.lockUncancelable(self.io);
+        const failed = live.failed;
+        const msg = live.err_msg;
+        live.mu.unlock(self.io);
+        if (!failed) return false;
+        if (msg.len > 0) self.last_err = try arena.dupe(u8, msg);
+        return true;
+    }
+
+    fn noteRunFailure(self: *Bridge, live: *Live, epoch: u32, message: []const u8) void {
+        const owned = self.gpa.dupe(u8, message) catch {
+            live.mu.lockUncancelable(self.io);
+            defer live.mu.unlock(self.io);
+            if (live.epoch == epoch) live.failed = true;
+            return;
+        };
+        live.mu.lockUncancelable(self.io);
+        defer live.mu.unlock(self.io);
+        if (live.epoch != epoch) {
+            self.gpa.free(owned);
+            return;
+        }
+        live.failed = true;
+        if (live.err_msg.len > 0 and terminalLifecycle(owned)) {
+            self.gpa.free(owned);
+            return;
+        }
+        if (live.err_msg.len > 0) self.gpa.free(live.err_msg);
+        live.err_msg = owned;
+    }
+
     fn continuationAlreadyApplied(self: *Bridge, continuation: []const protocol.ToolResult) bool {
         if (continuation.len == 0) return false;
         for (continuation) |c| {
@@ -296,7 +328,7 @@ pub const Bridge = struct {
         if (pending.len == 0) {
             if (self.continuationAlreadyApplied(parsed.continuation)) {
                 std.log.info("continuation already applied id={s}", .{parsed.continuation[0].call_id});
-                try self.resumeIfSendClosed(arena, live, parsed);
+                try self.resumeIfSendClosed(arena, live, parsed, true);
                 return;
             }
             if (parsed.continuation.len > 0) {
@@ -321,6 +353,9 @@ pub const Bridge = struct {
             self.last_err = try std.fmt.allocPrint(arena, "missing tool_result for: {s}", .{try joinIds(arena, missing.items)});
             return error.MissingToolResult;
         }
+        // Clear before fulfill. Cursor can stream the next delta or
+        // turn-ended as soon as the tool RPC returns.
+        live.resetSegment();
         for (live_results) |c| {
             if (!self.hub.fulfill(c.call_id, c.output)) {
                 self.last_err = try std.fmt.allocPrint(arena, "unknown tool_use_id: {s}", .{c.call_id});
@@ -330,19 +365,24 @@ pub const Bridge = struct {
                 if (w.from_restore) self.hub.forget(w);
             }
         }
-        try self.resumeIfSendClosed(arena, live, parsed);
+        try self.resumeIfSendClosed(arena, live, parsed, false);
     }
 
     /// Cursor often ends Agent.send when it yields tools. The tool RPC is a
     /// separate call. After the result is in, a closed send must be started
     /// again or the next HTTP response is an empty assistant message.
-    fn resumeIfSendClosed(self: *Bridge, arena: std.mem.Allocator, live: *Live, parsed: protocol.Parsed) !void {
+    /// A spent retry does not clear the segment. The open send keeps any
+    /// text it already has. One post-tool quiet starts a single force send.
+    fn resumeIfSendClosed(self: *Bridge, arena: std.mem.Allocator, live: *Live, parsed: protocol.Parsed, already_applied: bool) !void {
         live.mu.lockUncancelable(self.io);
         const busy = live.inflight;
+        const stalled = live.post_tool_quiet;
+        const force_busy = live.force_inflight;
         live.mu.unlock(self.io);
-        if (busy) {
-            live.resetSegment();
-            return;
+        switch (resumeAfterTool(already_applied, busy, stalled, force_busy)) {
+            .leave_inflight => return,
+            .keep_open, .clear_then_keep_open => return,
+            .start_force => {},
         }
         const send_json_tmp = try std.fmt.allocPrint(arena,
             "{{\"agentId\":{f},\"message\":{{\"text\":\"\"}},\"options\":{{\"enableDeltas\":true{s}}}}}",
@@ -350,18 +390,24 @@ pub const Bridge = struct {
         );
         const owned = try self.gpa.dupe(u8, send_json_tmp);
         live.mu.lockUncancelable(self.io);
-        if (live.inflight) {
+        const again = resumeAfterTool(already_applied, live.inflight, live.post_tool_quiet, live.force_inflight);
+        if (again != .start_force) {
             live.mu.unlock(self.io);
             self.gpa.free(owned);
-            live.resetSegment();
             return;
         }
         live.epoch += 1;
         live.finished = false;
         live.failed = false;
         live.batch_ready = false;
+        live.post_tool_quiet = false;
+        live.force_inflight = true;
         live.text.clearRetainingCapacity();
         live.thinking.clearRetainingCapacity();
+        if (live.err_msg.len > 0) {
+            self.gpa.free(live.err_msg);
+            live.err_msg = "";
+        }
         self.gpa.free(live.send_json);
         live.send_json = owned;
         const epoch = live.epoch;
@@ -392,7 +438,7 @@ pub const Bridge = struct {
         var last_progress = nowMs(self.io);
         var last_chars: usize = 0;
         while (true) {
-            if (live.failed) return error.BridgeRpcFailed;
+            if (try self.failLive(arena, live)) return error.BridgeRpcFailed;
             const finished = live.finished or live.batchReady();
             const n = self.hub.unresolvedCount(live.agent_id);
             live.mu.lockUncancelable(self.io);
@@ -430,10 +476,14 @@ pub const Bridge = struct {
             }
             if (after_tool and n == 0 and !finished and chars == 0 and idle > 180_000) {
                 std.log.warn("waitBoundary post-tool quiet agent={s}", .{live.agent_id});
+                live.mu.lockUncancelable(self.io);
+                live.post_tool_quiet = true;
+                live.mu.unlock(self.io);
                 break;
             }
             sleepMs(self.io, if (n > 0 or finished) 20 else 5);
         }
+        if (try self.failLive(arena, live)) return error.BridgeRpcFailed;
         const snaps = try self.hub.snapshotUnresolved(arena, live.agent_id);
         live.replacePublished(snaps) catch {};
         self.savePending(arena, live, parsed, snaps);
@@ -678,6 +728,9 @@ const Live = struct {
     finished: bool = false,
     failed: bool = false,
     inflight: bool = false,
+    force_inflight: bool = false,
+    post_tool_quiet: bool = false,
+    err_msg: []u8 = "",
     epoch: u32 = 0,
     agent_id: []u8,
     session_id: []u8,
@@ -706,6 +759,7 @@ const Live = struct {
         defer self.mu.unlock(self.io);
         if (self.epoch != epoch) return;
         self.inflight = false;
+        self.force_inflight = false;
         self.finished = true;
         self.batch_ready = true;
         if (failed) self.failed = true;
@@ -836,6 +890,14 @@ fn applyEnvelope(arena: std.mem.Allocator, payload: []const u8, live: *Live, epo
     if (jsonx.get(parsed.value, "sdkMessage")) |msg| {
         const typ = jsonx.getStr(msg, "type") orelse return;
         const m = jsonx.get(msg, "message") orelse return;
+        if (std.mem.eql(u8, typ, "status")) {
+            const status_text = jsonx.getStr(m, "message") orelse "";
+            const lifecycle = if (jsonx.get(m, "status")) |s| lifecycleText(s) else "";
+            if (runFailure(status_text, lifecycle, "", "")) |fail| {
+                live.bridge.noteRunFailure(live, epoch, fail.message);
+            }
+            return;
+        }
         if (std.mem.eql(u8, typ, "assistant")) {
             const piece = jsonx.getStr(m, "text") orelse jsonx.collectText(m, arena) catch "";
             live.mu.lockUncancelable(live.io);
@@ -852,7 +914,16 @@ fn applyEnvelope(arena: std.mem.Allocator, payload: []const u8, live: *Live, epo
         return;
     }
     if (jsonx.get(parsed.value, "result")) |res| {
+        const lifecycle = if (jsonx.get(res, "status")) |s| lifecycleText(s) else "";
+        const error_code = jsonx.getStr(res, "errorCode") orelse jsonx.getStr(res, "error_code") orelse "";
         const inner = jsonx.get(res, "result") orelse res;
+        const error_message = jsonx.getStr(inner, "errorMessage") orelse jsonx.getStr(inner, "error_message") orelse "";
+        const inner_code = jsonx.getStr(inner, "errorCode") orelse jsonx.getStr(inner, "error_code") orelse "";
+        const code = if (error_code.len > 0) error_code else inner_code;
+        if (runFailure("", lifecycle, code, error_message)) |fail| {
+            live.bridge.noteRunFailure(live, epoch, fail.message);
+            return;
+        }
         const final_text = jsonx.getStr(inner, "text") orelse jsonx.getStr(inner, "result") orelse "";
         live.mu.lockUncancelable(live.io);
         const empty = live.text.items.len == 0;
@@ -955,6 +1026,160 @@ fn imagesJson(arena: std.mem.Allocator, images: []const protocol.Image) ![]const
 fn clip(text: []const u8, max: u32) []const u8 {
     if (text.len <= max) return text;
     return text[text.len - max ..];
+}
+
+/// What a continuation does to the open Agent.send.
+/// A fresh fulfill keeps the open send and clears the segment first, so a
+/// delta that arrives after the result is not wiped by a later reset.
+/// A spent retry leaves an open send alone until that send has gone quiet
+/// once. The next spent retry then starts one empty local.force Send.
+pub const Resume = enum {
+    keep_open,
+    clear_then_keep_open,
+    start_force,
+    leave_inflight,
+};
+
+pub fn resumeAfterTool(already_applied: bool, inflight: bool, stalled: bool, force_inflight: bool) Resume {
+    if (!already_applied) {
+        if (inflight) return .clear_then_keep_open;
+        return .start_force;
+    }
+    if (force_inflight) return .leave_inflight;
+    if (inflight and !stalled) return .leave_inflight;
+    return .start_force;
+}
+
+pub const RunFailure = struct {
+    message: []const u8,
+};
+
+/// sdk.v1 run failures arrive on a normal stream. Status payloads carry the
+/// human-readable message. RunStreamResult status ERROR, CANCELLED, or
+/// EXPIRED is terminal even when error_code is empty. 1.0.40 also puts
+/// error_code and error_message on RunResult.
+fn lifecycleText(v: std.json.Value) []const u8 {
+    return switch (v) {
+        .string => |s| s,
+        .integer => |n| switch (n) {
+            4 => "ERROR",
+            5 => "CANCELLED",
+            6 => "EXPIRED",
+            else => "",
+        },
+        else => "",
+    };
+}
+
+fn terminalLifecycle(lifecycle: []const u8) bool {
+    return std.mem.eql(u8, lifecycle, "ERROR") or
+        std.mem.eql(u8, lifecycle, "CANCELLED") or
+        std.mem.eql(u8, lifecycle, "EXPIRED") or
+        std.mem.eql(u8, lifecycle, "RUN_LIFECYCLE_STATUS_ERROR") or
+        std.mem.eql(u8, lifecycle, "RUN_LIFECYCLE_STATUS_CANCELLED") or
+        std.mem.eql(u8, lifecycle, "RUN_LIFECYCLE_STATUS_EXPIRED");
+}
+
+pub fn runFailure(status_message: []const u8, lifecycle: []const u8, error_code: []const u8, error_message: []const u8) ?RunFailure {
+    const bad = terminalLifecycle(lifecycle);
+    if (!bad and error_code.len == 0 and error_message.len == 0) return null;
+    if (status_message.len > 0) return .{ .message = status_message };
+    if (error_message.len > 0) return .{ .message = error_message };
+    if (error_code.len > 0) return .{ .message = error_code };
+    if (bad) return .{ .message = lifecycle };
+    return null;
+}
+
+test "fresh fulfill clears before the open send continues" {
+    try std.testing.expectEqual(Resume.clear_then_keep_open, resumeAfterTool(false, true, false, false));
+    try std.testing.expectEqual(Resume.start_force, resumeAfterTool(false, false, false, false));
+}
+
+test "spent retry starts one force send after the open send goes quiet" {
+    try std.testing.expectEqual(Resume.leave_inflight, resumeAfterTool(true, true, false, false));
+    try std.testing.expectEqual(Resume.start_force, resumeAfterTool(true, true, true, false));
+    try std.testing.expectEqual(Resume.leave_inflight, resumeAfterTool(true, true, true, true));
+    try std.testing.expectEqual(Resume.start_force, resumeAfterTool(true, false, true, false));
+}
+
+test "run failure uses the status message and the terminal result" {
+    try std.testing.expect(runFailure("still running", "RUNNING", "", "") == null);
+    const failed = runFailure("model overloaded", "ERROR", "", "");
+    try std.testing.expectEqualStrings("model overloaded", failed.?.message);
+    const coded = runFailure("", "RUN_LIFECYCLE_STATUS_ERROR", "10", "context too long");
+    try std.testing.expectEqualStrings("context too long", coded.?.message);
+    const bare = runFailure("", "ERROR", "", "");
+    try std.testing.expectEqualStrings("ERROR", bare.?.message);
+    try std.testing.expect(runFailure("", "FINISHED", "", "") == null);
+}
+
+test "status and result envelopes fail the live turn instead of empty text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    var hub = toolcb.Hub.init(io, std.testing.allocator);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    var bridge = Bridge{
+        .io = io,
+        .gpa = std.testing.allocator,
+        .client = .{ .allocator = std.testing.allocator, .io = io },
+        .base_url = "",
+        .bearer = "",
+        .api_key = "",
+        .workspace = "",
+        .hub = &hub,
+        .group = &group,
+    };
+    const live = try std.testing.allocator.create(Live);
+    defer std.testing.allocator.destroy(live);
+    live.* = .{
+        .bridge = &bridge,
+        .io = io,
+        .gpa = std.testing.allocator,
+        .arena_state = std.heap.ArenaAllocator.init(std.testing.allocator),
+        .send_json = try std.testing.allocator.dupe(u8, "{}"),
+        .agent_id = try std.testing.allocator.dupe(u8, "agent-1"),
+        .session_id = try std.testing.allocator.dupe(u8, "session-1"),
+        .epoch = 1,
+    };
+    defer {
+        std.testing.allocator.free(live.send_json);
+        std.testing.allocator.free(live.agent_id);
+        std.testing.allocator.free(live.session_id);
+        if (live.err_msg.len > 0) std.testing.allocator.free(live.err_msg);
+        live.text.deinit(std.testing.allocator);
+        live.thinking.deinit(std.testing.allocator);
+        live.arena_state.deinit();
+    }
+    try applyEnvelope(arena,
+        \\{"sdkMessage":{"type":"status","message":{"status":"ERROR","message":"model overloaded"}}}
+    , live, 1);
+    try std.testing.expect(live.failed);
+    try std.testing.expectEqualStrings("model overloaded", live.err_msg);
+    try std.testing.expectEqual(@as(usize, 0), live.text.items.len);
+    try applyEnvelope(arena,
+        \\{"result":{"status":"ERROR","result":{"result":""}}}
+    , live, 1);
+    try std.testing.expectEqualStrings("model overloaded", live.err_msg);
+
+    live.failed = false;
+    std.testing.allocator.free(live.err_msg);
+    live.err_msg = "";
+    try applyEnvelope(arena,
+        \\{"result":{"status":"ERROR","errorCode":"10","result":{"errorMessage":"context too long","result":""}}}
+    , live, 1);
+    try std.testing.expect(live.failed);
+    try std.testing.expectEqualStrings("context too long", live.err_msg);
+    try std.testing.expectEqual(@as(usize, 0), live.text.items.len);
+
+    live.failed = false;
+    try applyEnvelope(arena,
+        \\{"result":{"status":"FINISHED","result":{"result":"kept text"}}}
+    , live, 1);
+    try std.testing.expect(!live.failed);
+    try std.testing.expectEqualStrings("kept text", live.text.items);
 }
 
 pub fn findBridgeBinary(env: *const std.process.Environ.Map, allocator: std.mem.Allocator) ?[]const u8 {
