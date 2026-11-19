@@ -184,7 +184,7 @@ test "bindFirst without fallback fails instead of sharing" {
 test "endpointJson names the bound port and flags a fallback" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const j = try endpointJson(arena.allocator(), "127.0.0.1", 8081, 8080, 42, "inst_x", "0.2.2");
+    const j = try endpointJson(arena.allocator(), "127.0.0.1", 8081, 8080, 42, "inst_x", "0.2.3");
     const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), j, .{});
     try std.testing.expectEqual(@as(i64, 8081), parsed.value.object.get("port").?.integer);
     try std.testing.expectEqualStrings("http://127.0.0.1:8081/v1", parsed.value.object.get("base_url").?.string);
