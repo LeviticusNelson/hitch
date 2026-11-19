@@ -94,7 +94,7 @@ Windows has no `start.sh`. Run `hitch.exe` in a terminal after editing `%USERPRO
 
 ### From source
 
-Zig 0.16. The compiled binary is not in git.
+Zig 0.17.1. The compiled binary is not in git.
 
 ```bash
 git clone https://github.com/LeviticusNelson/hitch.git
