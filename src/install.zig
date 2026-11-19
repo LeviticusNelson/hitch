@@ -112,7 +112,7 @@ fn writeExec(io: Io, path: []const u8, bytes: []const u8) !void {
 fn chmodExec(path: []const u8) !void {
     if (builtin.os.tag == .windows) return;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const z = try std.fmt.bufPrintZ(&buf, "{s}", .{path});
+    const z = try std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0);
     _ = std.c.chmod(z, 0o755);
 }
 

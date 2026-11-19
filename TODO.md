@@ -155,7 +155,7 @@ Last reviewed: 2026-09-19 (pending jsonl, lineage hash, managed pool, run caps).
 
 | Item | Status |
 |---|---|
-| Pin cursor-sdk-bridge 1.0.30 | done |
+| Pin cursor-sdk-bridge 1.0.40 | done |
 | One-command refresh | done |
 | Document :8080 vs :8081 | done |
 

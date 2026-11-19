@@ -15,4 +15,4 @@
 
 ## Standard library
 
-Zig 0.16 standard library — used under the Zig license terms that ship with the compiler.
+Zig 0.17.1 standard library — used under the Zig license terms that ship with the compiler.

@@ -2,11 +2,17 @@ const std = @import("std");
 const auth = @import("auth.zig");
 
 pub const version = "0.2.2";
-pub const sdk_version = "1.0.30";
+pub const sdk_version = "1.0.40";
 
 pub const Config = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 8081,
+    /// When PORT is already served by another process, try this many ports
+    /// above it, then an OS-assigned port. PORT_FALLBACK=0 fails instead.
+    port_search: u16 = 10,
+    port_fallback: bool = true,
+    /// Where endpoint.json and port are published (HITCH_ENDPOINT_DIR); empty means state_dir.
+    endpoint_dir: []const u8 = "",
     auth_mode: auth.Mode = .byok,
     gateway_access_key: ?[]const u8 = null,
     managed_cursor_key: ?[]const u8 = null,
@@ -33,6 +39,11 @@ pub const Config = struct {
         var c: Config = .{};
         if (env.get("HOST")) |h| c.host = h;
         if (env.get("PORT")) |p| c.port = std.fmt.parseInt(u16, p, 10) catch c.port;
+        if (env.get("PORT_SEARCH")) |p| c.port_search = std.fmt.parseInt(u16, p, 10) catch c.port_search;
+        if (env.get("HITCH_ENDPOINT_DIR")) |d| c.endpoint_dir = d;
+        if (env.get("PORT_FALLBACK")) |v| {
+            if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off") or std.ascii.eqlIgnoreCase(v, "false")) c.port_fallback = false;
+        }
         if (env.get("AUTH_MODE")) |m| {
             if (std.mem.eql(u8, m, "managed")) c.auth_mode = .managed;
         }

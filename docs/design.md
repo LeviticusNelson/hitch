@@ -22,7 +22,7 @@ Cursor documents [SDK Bridge](https://cursor.com/docs/sdk/bridge) for languages 
 Grok  --HTTP/1.1 SSE-->  zig :8081  --Connect sdk.v1-->  cursor-sdk-bridge  --HTTPS-->  Cursor
 ```
 
-The bridge binary embeds `@cursor/sdk`. We pin a release whose `sdkVersion` matches Node’s pin (`1.0.30` today). Adapters use HTTP/1.1 Connect (not classic gRPC/H2). Custom tools are callbacks the Zig process hosts; the bridge calls back.
+The bridge binary embeds `@cursor/sdk`. We pin a release whose `sdkVersion` matches Node’s pin (`1.0.40` today). Adapters use HTTP/1.1 Connect (not classic gRPC/H2). Custom tools are callbacks the Zig process hosts; the bridge calls back.
 
 That is how we “make the SDK work in Zig” without copying internals. A native Zig executor is out of scope unless the bridge is proven insufficient.
 

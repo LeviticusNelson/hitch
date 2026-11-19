@@ -19,6 +19,7 @@ const pool_mod = @import("pool.zig");
 const protocol = @import("protocol.zig");
 const toolcb = @import("toolcb.zig");
 const rawhttp = @import("rawhttp.zig");
+const listen_mod = @import("listen.zig");
 
 const version = config_mod.version;
 const install = @import("install.zig");
@@ -157,16 +158,26 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const address = Io.net.IpAddress.parse(cfg.host, cfg.port) catch |err| {
-        std.log.err("invalid listen address {s}:{d}: {t}", .{ cfg.host, cfg.port, err });
+    var port_buf: [64]u16 = undefined;
+    const ports = listen_mod.candidates(&port_buf, cfg.port, @min(cfg.port_search, port_buf.len - 2), cfg.port_fallback);
+    const bound = listen_mod.bindFirst(io, cfg.host, ports) catch |err| {
+        std.log.err("no listen port on {s} (configured {d}, search {d}, fallback {}): {t}", .{ cfg.host, cfg.port, cfg.port_search, cfg.port_fallback, err });
         return err;
     };
-    var listener = try address.listen(io, .{ .reuse_address = true });
+    var listener = bound.server;
     defer listener.socket.close(io);
+    if (bound.port != cfg.port) {
+        std.log.warn("configured port {d} is served by another process; hitch fell back to {d}", .{ cfg.port, bound.port });
+    }
+    const endpoint = try listen_mod.endpointJson(arena, cfg.host, bound.port, cfg.port, listen_mod.selfPid(), instance, version);
+    const endpoint_dir = if (cfg.endpoint_dir.len > 0) cfg.endpoint_dir else cfg.state_dir;
+    listen_mod.publish(io, arena, endpoint_dir, endpoint, bound.port) catch |err| {
+        std.log.warn("publish endpoint to {s} failed ({t})", .{ endpoint_dir, err });
+    };
 
     std.log.info("hitch listening http://{s}:{d} version={s} catalog={s} inference={s}", .{
         cfg.host,
-        cfg.port,
+        bound.port,
         version,
         if (app.catalog != null) "native" else "fake",
         if (app.use_fake) "fake" else if (app.cursor_bridge != null) "sdk-bridge" else "unavailable",
@@ -236,6 +247,7 @@ test {
     _ = toolcb;
     _ = @import("mcpfallback.zig");
     _ = rawhttp;
+    _ = listen_mod;
 }
 
 fn pathOnly(target: []const u8) []const u8 {

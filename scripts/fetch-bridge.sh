@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Download cursor-sdk-bridge 1.0.30 (matches Node @cursor/sdk pin) into
-# ~/.hitch/bridge/v1.0.30/ (never commit this binary)
+# Download cursor-sdk-bridge 1.0.40 (matches Node @cursor/sdk pin) into
+# ~/.hitch/bridge/v1.0.40/ (never commit this binary)
 set -euo pipefail
-VERSION="${CURSOR_SDK_BRIDGE_VERSION:-1.0.30}"
+VERSION="${CURSOR_SDK_BRIDGE_VERSION:-1.0.40}"
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 case "$OS" in
