@@ -4,6 +4,10 @@ export PATH="/opt/homebrew/bin:/usr/sbin:/usr/bin:/bin${PATH:+:$PATH}"
 DIR="${HITCH_DIR:-$HOME/.hitch}"
 PID_FILE="$DIR/gateway.pid"
 LOCK_DIR="$DIR/gateway.lock.d"
+PORT_FILE="$DIR/port"
+port=""
+[[ -f "$PORT_FILE" ]] && port="$(tr -dc '0-9' <"$PORT_FILE" 2>/dev/null || true)"
+port="${port:-${PORT:-8080}}"
 
 if [[ -f "$PID_FILE" ]]; then
   pid=$(cat "$PID_FILE")
@@ -25,16 +29,18 @@ else
   echo "no pid file"
 fi
 
-if lsof -nP -iTCP:8080 -sTCP:LISTEN >/dev/null 2>&1; then
-  listen_pid=$(lsof -nP -t -iTCP:8080 -sTCP:LISTEN | head -1)
+# Only a hitch listener on the hitch port; never another service sharing the number.
+for listen_pid in $(lsof -nP -t -iTCP@127.0.0.1:"$port" -sTCP:LISTEN 2>/dev/null); do
   cmd=$(ps -p "$listen_pid" -o comm= 2>/dev/null || true)
   if [[ "$cmd" == *hitch* || "$cmd" == *cursor-sdk2api-zig* ]]; then
     kill "$listen_pid" 2>/dev/null || true
     sleep 0.2
     kill -9 "$listen_pid" 2>/dev/null || true
-    echo "cleared hitch listen pid=$listen_pid"
+    echo "cleared hitch listen pid=$listen_pid port=$port"
   fi
-fi
+done
+# hitch has no signal handler, so the published endpoint is cleared here.
+rm -f "$DIR/endpoint.json" "$DIR/endpoint.json.tmp" "$PORT_FILE" "$PORT_FILE.tmp"
 # Reap leftover official bridge children (they survive SIGKILL of hitch and leak RAM).
 reap_bridges() {
   local ws="${HITCH_WORKSPACE:-$DIR/workspace}"

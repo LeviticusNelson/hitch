@@ -15,6 +15,8 @@ if [[ ! -x "$OUT" ]]; then
   exit 1
 fi
 mkdir -p "$(dirname "$DEST")"
-cp "$OUT" "$DEST"
-chmod +x "$DEST"
+# New inode via rename: overwriting a running Mach-O in place can get the live hitch killed.
+cp "$OUT" "$DEST.tmp"
+chmod +x "$DEST.tmp"
+mv -f "$DEST.tmp" "$DEST"
 echo "installed $DEST ($(wc -c <"$DEST") bytes)"
